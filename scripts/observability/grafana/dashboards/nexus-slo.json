@@ -1,0 +1,261 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "S1 — Tenant CRUD p99 (target < 200ms)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        {
+          "expr": "max(nexus_slo:p99_latency_seconds{path=~\"/api/v1/tenants.*\"})",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null  },
+              { "color": "yellow", "value": 0.15  },
+              { "color": "red",    "value": 0.20  }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+    {
+      "title": "S2 — Event Ingest p99 (target < 500ms)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        {
+          "expr": "nexus_slo:p99_latency_seconds{path=\"/api/v1/events\", method=\"POST\"}",
+          "legendFormat": "p99 POST /events"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null  },
+              { "color": "yellow", "value": 0.40  },
+              { "color": "red",    "value": 0.50  }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+    {
+      "title": "S3 — Event Read p95 (target < 300ms)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        {
+          "expr": "max(nexus_slo:p95_latency_seconds{path=~\"/api/v1/events.*\", method=\"GET\"})",
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green",  "value": null  },
+              { "color": "yellow", "value": 0.20  },
+              { "color": "red",    "value": 0.30  }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+    {
+      "title": "S5 — Error Budget Remaining (7d)",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        {
+          "expr": "nexus_slo:error_budget_remaining_ratio",
+          "legendFormat": "budget"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": -0.5,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red",    "value": null  },
+              { "color": "yellow", "value": 0.10  },
+              { "color": "green",  "value": 0.50  }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      }
+    },
+    {
+      "title": "Latency vs SLO thresholds",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        {
+          "expr": "nexus_slo:p99_latency_seconds{path=\"/api/v1/events\", method=\"POST\"}",
+          "legendFormat": "S2 p99 POST /events"
+        },
+        {
+          "expr": "nexus_slo:p95_latency_seconds{path=~\"/api/v1/events.*\", method=\"GET\"}",
+          "legendFormat": "S3 p95 GET /events*"
+        },
+        {
+          "expr": "max(nexus_slo:p99_latency_seconds{path=~\"/api/v1/tenants.*\"})",
+          "legendFormat": "S1 p99 tenants"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null  },
+              { "color": "red",   "value": 0.50  }
+            ]
+          },
+          "custom_thresholdsStyle": { "mode": "line" }
+        }
+      }
+    },
+    {
+      "title": "Error rate (5m fast / 1h slow)",
+      "type": "timeseries",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        {
+          "expr": "nexus_slo:error_ratio_5m",
+          "legendFormat": "5m (fast burn)"
+        },
+        {
+          "expr": "nexus_slo:error_ratio_1h",
+          "legendFormat": "1h (slow burn)"
+        },
+        {
+          "expr": "vector(0.001)",
+          "legendFormat": "S4 threshold (0.1%)"
+        },
+        {
+          "expr": "vector(0.02)",
+          "legendFormat": "fast-burn alert (2%)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "title": "Latency by (method, path) — current",
+      "type": "table",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "targets": [
+        {
+          "expr": "nexus_slo:p99_latency_seconds",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s" },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Value" },
+            "properties": [
+              { "id": "displayName", "value": "p99 latency" },
+              { "id": "custom.cellOptions", "value": { "type": "color-background" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green",  "value": null  },
+                    { "color": "yellow", "value": 0.30  },
+                    { "color": "red",    "value": 0.50  }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true },
+            "indexByName": { "method": 0, "path": 1, "Value": 2 }
+          }
+        }
+      ]
+    },
+    {
+      "title": "Hint",
+      "type": "text",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 13 },
+      "options": {
+        "mode": "markdown",
+        "content": "**This dashboard reads from `nexus_slo:*` recording rules**, not raw histograms — so panels load fast and match the alert expressions exactly.\n\n**Per-panel meaning:**\n\n- **Top row stats**: current state vs SLO target. Background colour goes yellow at 75% of threshold, red at 100%. If a panel goes red, the corresponding Prometheus alert (e.g. `EventIngestP99LatencyBreached`) will be `pending` and will fire after `for: 5m`.\n\n- **Latency vs SLO thresholds**: trend over time. Watch for trajectories — a value approaching a threshold for 5 minutes is the multi-window alert pattern's design target.\n\n- **Error rate panel**: 5m and 1h series side-by-side. The fast/slow burn pattern from the SRE workbook is implemented as `ErrorBudgetFastBurn` (5m > 2%) and `ErrorBudgetSlowBurn` (1h > 0.5%). Both threshold lines are plotted.\n\n- **Latency by (method, path)**: drill-down for which route is slow. The Ch14 fix that swapped raw URL paths for chi route patterns means cardinality is bounded and PII-safe.\n\n- **Error budget gauge**: 100% = no errors consumed; 0% = budget exhausted; negative = over budget. Window is 7 days, not 30 (see `docs/SLOs.md` for why).\n\nRule definitions: `nexus/scripts/observability/recording-rules.yml`.\nSLO targets: `nexus/docs/SLOs.md`."
+      }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["nexus", "ddia-course", "slo"],
+  "templating": { "list": [] },
+  "time": { "from": "now-30m", "to": "now" },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "Nexus — SLO Compliance",
+  "uid": "nexus-slo"
+}

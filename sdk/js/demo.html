@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Nexus SDK — Live Demo</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+         max-width: 760px; margin: 2rem auto; padding: 0 1rem;
+         background: #0b0e14; color: #d6deeb; line-height: 1.55; }
+  h1 { color: #82aaff; margin-bottom: 0.2rem; }
+  h2 { color: #c3e88d; margin-top: 2rem; }
+  .panel { background: #11151c; border: 1px solid #1f2937;
+           border-radius: 8px; padding: 1rem 1.25rem; margin: 1rem 0; }
+  button { background: #82aaff; color: #0b0e14; border: 0; padding: 0.5rem 1rem;
+           border-radius: 6px; cursor: pointer; font-weight: 600; margin: 0.25rem; }
+  button:hover { background: #a3c1ff; }
+  input { background: #0b0e14; color: #d6deeb; border: 1px solid #2a3548;
+          padding: 0.5rem; border-radius: 6px; font-family: inherit; width: 320px; }
+  code { background: #1f2937; padding: 0.1rem 0.4rem; border-radius: 4px; color: #ffcb6b; }
+  pre  { background: #060810; padding: 0.75rem 1rem; border-radius: 6px;
+         overflow-x: auto; font-size: 0.85rem; color: #c3e88d; max-height: 320px; }
+  small { color: #7a8a9e; }
+</style>
+</head>
+<body>
+
+<h1>Nexus SDK Demo</h1>
+<small>Drop-in browser SDK for the Nexus analytics API.</small>
+
+<div class="panel">
+  <h2>1. Configure</h2>
+  <p>Paste a <strong>tenant API key</strong>. Mint one with an admin key
+  (the API key sets the tenant — you don't send a tenant id):</p>
+  <pre>curl -X POST localhost:8000/api/v1/admin/api-keys \
+  -H "X-API-Key: $ADMIN_KEY" \
+  -d '{"scope":"tenant","tenant_id":"&lt;UUID&gt;","name":"demo"}'</pre>
+  <input id="apikey" placeholder="api key (nxs_live_…)">
+  <input id="host" value="http://localhost:8000">
+  <br>
+  <button id="init-btn">Initialise SDK</button>
+</div>
+
+<div class="panel">
+  <h2>2. Capture events</h2>
+  <button onclick="nexus.capture('button_clicked', { label: 'cta_top', value: 1 })">cta_top</button>
+  <button onclick="nexus.capture('button_clicked', { label: 'cta_bottom', value: 1 })">cta_bottom</button>
+  <button onclick="nexus.capture('purchase_completed', { sku: 'pro-monthly', value: 49 })">purchase</button>
+  <button onclick="nexus.capture('search_performed', { q: document.getElementById('q').value })">search</button>
+  <br>
+  <input id="q" placeholder="search query">
+</div>
+
+<div class="panel">
+  <h2>3. Identify a user</h2>
+  <p>Promotes the anonymous device to a known person. The previous
+  <code>distinct_id</code> rides along as <code>$anon_distinct_id</code>
+  so the server can merge histories.</p>
+  <input id="uid" placeholder="user@example.com">
+  <button onclick="nexus.identify(document.getElementById('uid').value, { plan: 'pro' })">Identify</button>
+  <button onclick="nexus.reset()">Reset (new anon device)</button>
+</div>
+
+<div class="panel">
+  <h2>4. SPA pageviews</h2>
+  <p>These call <code>history.pushState()</code>. The SDK auto-captures
+  a <code>$pageview</code> for each — no extra code required.</p>
+  <button onclick="history.pushState({}, '', '/products')">/products</button>
+  <button onclick="history.pushState({}, '', '/checkout')">/checkout</button>
+  <button onclick="history.pushState({}, '', '/')">/</button>
+</div>
+
+<div class="panel">
+  <h2>5. State</h2>
+  <button onclick="refreshState()">Refresh</button>
+  <button onclick="nexus.flush()">Force flush</button>
+  <pre id="state">SDK not initialised.</pre>
+</div>
+
+<div class="panel">
+  <h2>6. Verify on the server</h2>
+  <pre id="verify">
+# Fetch the last 20 events — the tenant comes from the API key:
+curl -H "X-API-Key: &lt;YOUR_KEY&gt;" \
+  "http://localhost:8000/api/v1/events?limit=20" | jq</pre>
+</div>
+
+<script src="nexus.js"></script>
+<script>
+  document.getElementById('init-btn').addEventListener('click', function () {
+    var apiKey = document.getElementById('apikey').value.trim();
+    var host = document.getElementById('host').value.trim();
+    if (!apiKey) { alert('apiKey is required'); return; }
+    nexus.init({ apiKey: apiKey, host: host, debug: true, batchSize: 5, flushIntervalMs: 3000 });
+    refreshState();
+  });
+
+  function refreshState() {
+    var s = {
+      deviceId: nexus.deviceId,
+      distinctId: nexus.distinctId,
+      sessionId: nexus.sessionId,
+      queued: nexus.queueLength
+    };
+    document.getElementById('state').textContent = JSON.stringify(s, null, 2);
+  }
+</script>
+
+</body>
+</html>

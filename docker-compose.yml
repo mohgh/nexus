@@ -1,0 +1,217 @@
+# Nexus — Data-Intensive SaaS Platform
+#
+# All data systems wired into the Nexus Go runtime live here. The
+# course also discusses Elasticsearch, Neo4j, and Debezium (CDC) at
+# the slide level — those are NOT included here because no Go code
+# imports them. If you want to add them as live demos, create a fork
+# or a separate compose file rather than re-introducing services
+# without callers.
+#
+# Quick start (Ch01–03 use only these defaults):
+#   docker compose up -d
+#
+# Everything for any chapter:
+#   make docker-up-all      # (see Makefile)
+#
+# Profile gating: services with no `profiles:` key start by default
+# (postgres, redis). Everything else is opt-in via `--profile X`.
+
+services:
+
+  # ─── OLTP: Primary Database (used by every chapter) ───────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: nexus-postgres
+    environment:
+      POSTGRES_USER: nexus
+      POSTGRES_PASSWORD: nexus_secret
+      POSTGRES_DB: nexus
+    ports:
+      - "5432:5432"
+    command:
+      - postgres
+      - -c
+      - wal_level=replica         # Ch06: required for streaming replication
+      - -c
+      - max_wal_senders=5         # Ch06: allow up to 5 replicas
+      - -c
+      - max_replication_slots=5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/db/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./scripts/replication/primary-setup.sh:/docker-entrypoint-initdb.d/02-replication.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ─── Replication: Read Replica (Chapter 6) ────────────────────────────────
+  # Uses pg_basebackup to clone the primary on first start, then follows
+  # via streaming replication. Query pg_stat_replication on the primary
+  # or GET /api/v1/replication-lag to observe the lag.
+  postgres-replica:
+    image: postgres:16-alpine
+    container_name: nexus-postgres-replica
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PRIMARY_HOST: postgres
+      PRIMARY_PORT: "5432"
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator_secret
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./scripts/replication/replica-entrypoint.sh:/replica-entrypoint.sh
+    entrypoint: ["bash", "/replica-entrypoint.sh"]
+    profiles: ["replication"]
+
+  # ─── In-Memory Cache / Coordination (Ch04 cache, Ch10 election, ──────────
+  # ─── Ch12 watermark + window state, Ch13 idempotency cache, Ch14 audit) ──
+  redis:
+    image: redis:7-alpine
+    container_name: nexus-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ─── Message Broker / Event Streaming ─────────────────────────────────────
+  # Ch05: Kafka producer publishes events post-write.
+  # Ch08: outbox worker publishes billing_records to Kafka.
+  # Ch09: chaos drop_publish toggle demonstrates asymmetric failure.
+  # Ch12: stream-processor consumes events and aggregates windows.
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: nexus-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    profiles: ["streaming"]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: nexus-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    profiles: ["streaming"]
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: nexus-kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: nexus
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    profiles: ["streaming"]
+
+  # ─── Schema Registry for Avro/Protobuf (Chapter 5) ───────────────────────
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.0
+    container_name: nexus-schema-registry
+    depends_on:
+      - kafka
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+    profiles: ["streaming"]
+
+  # ─── Observability (Ch02 — and Ch14 to verify Prom label fix) ────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: nexus-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./scripts/observability/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./scripts/observability/recording-rules.yml:/etc/prometheus/recording-rules.yml
+      - prometheus_data:/prometheus
+    profiles: ["observability"]
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: nexus-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./scripts/observability/grafana/provisioning:/etc/grafana/provisioning
+      - ./scripts/observability/grafana/dashboards:/var/lib/grafana/dashboards
+    profiles: ["observability"]
+
+  # ─── OLAP Column Store (Ch04 storage demo, Ch11 batch aggregation) ───────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24
+    container_name: nexus-clickhouse
+    ports:
+      - "8123:8123"   # HTTP interface  (curl http://localhost:8123)
+      - "9000:9000"   # Native TCP      (Go clickhouse-go driver)
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./scripts/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    profiles: ["olap"]
+
+  # ─── Durable Workflow Execution (Chapter 8) ───────────────────────────────
+  temporal:
+    image: temporalio/auto-setup:1.24
+    container_name: nexus-temporal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=nexus
+      - POSTGRES_PWD=nexus_secret
+      - POSTGRES_SEEDS=postgres
+    ports:
+      - "7233:7233"   # gRPC frontend (Go SDK connects here)
+    profiles: ["workflows"]
+
+  temporal-ui:
+    image: temporalio/ui:2.26
+    container_name: nexus-temporal-ui
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    ports:
+      - "8233:8080"   # Web UI
+    profiles: ["workflows"]
+
+volumes:
+  postgres_data:
+  postgres_replica_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+  clickhouse_data:

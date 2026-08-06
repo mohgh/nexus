@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# SLO recording + alert rules. See docs/SLOs.md for the targets these
+# rules express. The dashboards read from the nexus_slo:* recorded
+# series rather than computing percentiles inline so panels load fast.
+rule_files:
+  - /etc/prometheus/recording-rules.yml
+
+scrape_configs:
+  # Nexus app — exposes /api/v1/metrics
+  - job_name: nexus
+    metrics_path: /api/v1/metrics
+    static_configs:
+      - targets: ["host.docker.internal:8000"]

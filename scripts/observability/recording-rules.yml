@@ -1,0 +1,191 @@
+# Prometheus recording + alert rules for the Nexus SLOs.
+#
+# Recording rules pre-compute the latency percentiles and error-rate
+# fractions that the Grafana dashboards and alert rules consume. The
+# naming convention is the Google SRE workbook style:
+#
+#   nexus_slo:<indicator>:<aggregation>
+#
+# Aggregations preserve BOTH method AND path so per-method SLOs (e.g.,
+# event ingest = POST, event read = GET — same path) stay separable.
+#
+# Alert rules use the multi-window multi-burn-rate pattern: a fast
+# burn (short window, high rate) catches incidents in progress; a
+# slow burn (longer window, lower rate) catches steady degradation
+# that would still exhaust the monthly error budget.
+#
+# Self-scrape filter: every recording rule excludes
+# path="/api/v1/metrics" because Prometheus scraping itself produces
+# a steady stream of fast 200s that would skew percentiles low and
+# inflate request counts in the denominators.
+#
+# Loaded by prometheus.yml via `rule_files:`.
+
+groups:
+  - name: nexus_slo_latency_recording
+    interval: 30s
+    rules:
+      # p99 per (method, path) — feeds dashboards and breach alerts.
+      # Method is kept in the label set so POST and GET on the same
+      # path (e.g., /api/v1/events) remain distinguishable: S2
+      # targets POST p99, S3 targets GET p95.
+      - record: nexus_slo:p99_latency_seconds
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (method, path, le) (
+              rate(nexus_http_request_duration_seconds_bucket{path!="/api/v1/metrics"}[5m])
+            )
+          )
+      # p95 — used for the event-read SLO (S3) and as a less-noisy
+      # comparison line for the p99 panels.
+      - record: nexus_slo:p95_latency_seconds
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (method, path, le) (
+              rate(nexus_http_request_duration_seconds_bucket{path!="/api/v1/metrics"}[5m])
+            )
+          )
+
+  - name: nexus_slo_error_recording
+    interval: 30s
+    rules:
+      # Server-error ratio over short and long windows; both are
+      # needed for multi-window burn-rate alerting below. The 5m
+      # window is the fast-burn signal; the 1h window is the
+      # slow-burn signal — together they implement the modern
+      # multi-window pattern from the SRE workbook (which has
+      # superseded any single fixed-window definition like
+      # "30 min").
+      #
+      # `or vector(0)` on the numerator: when there are zero 5xx
+      # responses (the happy path during a baseline load run),
+      # sum(rate(...)) returns no series at all rather than 0,
+      # which would make this whole rule produce no result. The
+      # dashboards and the S5 alert depend on this series existing
+      # with a numeric value — so we default it to 0 explicitly.
+      # Caught by actually running k6 against a clean stack and
+      # finding the error_budget gauge showed "no data."
+      - record: nexus_slo:error_ratio_5m
+        expr: |
+          (sum(rate(nexus_http_requests_total{status=~"5..", path!="/api/v1/metrics"}[5m])) or vector(0))
+          /
+          sum(rate(nexus_http_requests_total{path!="/api/v1/metrics"}[5m]))
+      - record: nexus_slo:error_ratio_1h
+        expr: |
+          (sum(rate(nexus_http_requests_total{status=~"5..", path!="/api/v1/metrics"}[1h])) or vector(0))
+          /
+          sum(rate(nexus_http_requests_total{path!="/api/v1/metrics"}[1h]))
+      - record: nexus_slo:error_ratio_6h
+        expr: |
+          (sum(rate(nexus_http_requests_total{status=~"5..", path!="/api/v1/metrics"}[6h])) or vector(0))
+          /
+          sum(rate(nexus_http_requests_total{path!="/api/v1/metrics"}[6h]))
+
+      # Error-budget remaining ratio over a 7-day window. The
+      # original SLO doc targets 99.5% over 30 days; we evaluate the
+      # budget on the 7-day rolling window instead so the rule
+      # produces meaningful output within a week of bringing
+      # Prometheus up, rather than reporting NaN/partial-window
+      # values for weeks. In an educational deployment where
+      # `docker compose down -v` is common, a 30d window almost
+      # never accumulates enough data to be actionable. The math is
+      # identical to the 30d formulation — budget is 0.5% of all
+      # requests — only the observation window is shorter.
+      #
+      # remaining_ratio > 0 : budget remaining
+      # remaining_ratio = 0 : budget exhausted
+      # remaining_ratio < 0 : over budget (negative = how far over)
+      - record: nexus_slo:error_budget_remaining_ratio
+        expr: |
+          1 - (
+            (
+              (sum(rate(nexus_http_requests_total{status=~"5..", path!="/api/v1/metrics"}[7d])) or vector(0))
+              /
+              sum(rate(nexus_http_requests_total{path!="/api/v1/metrics"}[7d]))
+            )
+            /
+            0.005
+          )
+
+  - name: nexus_slo_alerts
+    rules:
+      # S1: Tenant CRUD p99 over 200ms. Aggregation includes method
+      # since both GET and POST live under /api/v1/tenants*; the
+      # alert fires on either, which matches the SLO ("CRUD" =
+      # full lifecycle).
+      - alert: TenantP99LatencyBreached
+        expr: nexus_slo:p99_latency_seconds{path=~"/api/v1/tenants.*"} > 0.2
+        for: 5m
+        labels:
+          severity: warning
+          slo: S1
+        annotations:
+          summary: "Tenant CRUD p99 > 200ms for 5m"
+          description: "p99 latency on {{ $labels.method }} {{ $labels.path }} is {{ $value | humanizeDuration }} — exceeds SLO S1."
+
+      # S2: Event INGEST p99 over 500ms. The method filter is
+      # required: GET /api/v1/events has the same path label, but
+      # its SLO is S3 (p95 < 300ms), not S2. Without the filter
+      # this alert would fire on slow reads.
+      - alert: EventIngestP99LatencyBreached
+        expr: nexus_slo:p99_latency_seconds{path="/api/v1/events", method="POST"} > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          slo: S2
+        annotations:
+          summary: "Event ingest p99 > 500ms for 5m"
+          description: "p99 latency on POST /api/v1/events is {{ $value | humanizeDuration }} — exceeds SLO S2."
+
+      # S3: Event READ p95 over 300ms — same path as S2, different
+      # method, different percentile.
+      - alert: EventReadP95LatencyBreached
+        expr: nexus_slo:p95_latency_seconds{path=~"/api/v1/events.*", method="GET"} > 0.3
+        for: 5m
+        labels:
+          severity: warning
+          slo: S3
+        annotations:
+          summary: "Event read p95 > 300ms for 5m"
+          description: "p95 latency on GET {{ $labels.path }} is {{ $value | humanizeDuration }} — exceeds SLO S3."
+
+      # S4 fast burn: error rate >2% over 5m. At that sustained
+      # rate the 7-day / 0.5% budget exhausts in ~1.75 days
+      # (0.005 × 7d / 0.02 = 1.75d). Page immediately — even
+      # "exhausts in two days" is worth waking someone for.
+      - alert: ErrorBudgetFastBurn
+        expr: nexus_slo:error_ratio_5m > 0.02
+        for: 2m
+        labels:
+          severity: critical
+          slo: S4
+        annotations:
+          summary: "Fast error-budget burn"
+          description: "5m error ratio is {{ $value | humanizePercentage }} — at this rate the 7d budget exhausts in ~1.75 days."
+
+      # S4 slow burn: error rate >0.5% sustained over an hour.
+      # Slower-developing problem; warning, not page.
+      - alert: ErrorBudgetSlowBurn
+        expr: nexus_slo:error_ratio_1h > 0.005
+        for: 15m
+        labels:
+          severity: warning
+          slo: S4
+        annotations:
+          summary: "Slow error-budget burn"
+          description: "1h error ratio is {{ $value | humanizePercentage }} — exceeds SLO S4 target of 0.1%."
+
+      # S5: budget exhaustion. If this fires the rolling 7-day SLO
+      # has already been missed; the incident is for the next
+      # review.
+      - alert: ErrorBudgetExhausted
+        expr: nexus_slo:error_budget_remaining_ratio < 0
+        for: 5m
+        labels:
+          severity: warning
+          slo: S5
+        annotations:
+          summary: "7d error budget exhausted"
+          description: "Nexus has consumed >100% of the 7d error budget for SLO S5."

@@ -1,0 +1,23 @@
+# binaries
+bin/
+*.exe
+
+# env / secrets — never commit; .env.example is the template
+.env
+.env.local
+*.pem
+*.key
+
+# build & test artifacts
+dist/
+coverage.out
+*.test
+
+# local data
+tmp/
+*.log
+
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
