@@ -10,22 +10,30 @@ type healthResponse struct {
 	Status    string    `json:"status"`
 	Timestamp time.Time `json:"timestamp"`
 	Version   string    `json:"version"`
-	Chapter   string    `json:"chapter"`
 }
 
 // Health returns basic liveness information.
 // A failing health check means the process itself is broken.
 // Kubernetes restarts the pod on liveness failure.
+//
+// The response used to carry a "chapter" field naming the chapter the
+// build corresponded to. It was hardcoded, so it went stale the moment
+// the next chapter landed — /health is the first thing anyone curls,
+// and it was reporting chapter 04 on a codebase that runs through 14.
+// A liveness probe should answer "is this process alive", nothing more.
 func Health() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, healthResponse{
 			Status:    "ok",
 			Timestamp: time.Now().UTC(),
-			Version:   "0.4.0",
-			Chapter:   "04 — Storage and Retrieval",
+			Version:   version,
 		})
 	}
 }
+
+// version is the reported build version. Kept as a single package-level
+// constant so there is exactly one place to bump it.
+const version = "1.0.0"
 
 // Pinger is implemented by any dependency that can be health-checked.
 // Ch04: postgres pool, redis cache, and clickhouse client all implement this.

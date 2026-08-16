@@ -64,7 +64,7 @@ multi-window multi-burn-rate pattern).
 
 ## How to verify a change against the SLOs
 
-1. Bring up the observability stack: `make ch02`.
+1. Bring up the observability stack: `make run-observability`.
 2. Apply the change.
 3. Run a baseline load: `make load-baseline` (k6 script in
    `scripts/load/`).

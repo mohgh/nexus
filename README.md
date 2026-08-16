@@ -50,27 +50,41 @@ concrete answer in running code rather than a paragraph.
 2. **Leader election that is safe when a leader stalls.** A lease alone is not enough; a
    paused process can resume believing it still leads. `internal/election` issues monotonic
    **fencing tokens** and storage rejects anything stale.
-3. **GDPR erasure against an append-only store.** You cannot delete from an immutable log, so
-   the personal data never enters it in plaintext — `internal/gdpr` and `internal/pii`.
+3. **GDPR erasure against an append-only store.** The right to erasure and an immutable log
+   are in direct conflict, and `internal/gdpr` resolves it the blunt way: erasure `DELETE`s
+   from the log, anonymisation `UPDATE`s PII to `[REDACTED]` in place. That breaks the
+   append-only invariant deliberately — the code says so, and documents the alternatives it
+   does not implement (crypto-shredding, tombstones, compaction-with-rewrite).
 
 ---
 
 ## Running it
 
+**Prerequisites:** Go 1.24+, Docker, `make`, and
+[`golang-migrate`](https://github.com/golang-migrate/migrate) on your `PATH` (`make
+migrate-up` shells out to it). `k6` only if you want the load targets.
+
 ```bash
-make docker-up        # postgres + replica, redis, kafka, clickhouse, prometheus, grafana, temporal
+make docker-up        # postgres + redis
 make migrate-up
-make seed
+make seed             # 10k events across 6 tenants; ~30% carry PII for the Ch14 demos
 make run              # the API server
-make test
+make test             # unit tests only — see below
 ```
+
+Set `NEXUS_BOOTSTRAP_ADMIN_KEY` in `.env` before `make run`, or every `/api/v1` route will
+reject you. It is the credential you mint per-tenant keys with; see `.env.example`.
+
+`make test` runs the unit tier. Nine test files are behind `-tags=integration` and need
+live services — including all of `internal/transactions`, where the isolation-level
+anomalies live. Run those via `make test-fencing`, `make test-batch`, `make test-anomalies`.
 
 `make docker-up-all` brings up the full stack including Kafka UI, schema registry and the
 Temporal UI. `make load-baseline` and `make load-stress` drive the SLO dashboards.
 
 **Binaries:** `server` · `stream-processor` · `batch-aggregator` · `projection-rebuild` ·
 `storage-benchmark` · `pii-scanner`.
-**Also:** a JavaScript SDK in `sdk/js`, and [`docs/SLOs.md`](docs/SLOs.md) — nine SLOs the
+**Also:** a JavaScript SDK in `sdk/js`, and [`docs/SLOs.md`](docs/SLOs.md) — five SLOs the
 dashboards and alerts are actually calibrated against.
 
 ---

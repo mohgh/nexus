@@ -54,57 +54,65 @@ load-stress:
 	@command -v k6 >/dev/null 2>&1 || { echo "k6 not installed — see scripts/load/README.md"; exit 1; }
 	NEXUS_LOAD=stress k6 run scripts/load/baseline.js
 
-# ─── Chapter-specific targets ─────────────────────────────────────────────────
-# Each target starts the required Docker services, then runs the server.
-# Services not needed for a chapter are simply not started.
+# ─── Demo targets, by problem ─────────────────────────────────────────────────
+# Each target starts exactly the Docker services that problem needs, then runs
+# the right binary. Services a demo doesn't need are simply not started.
+#   run-*    boot the infra and a binary
+#   test-*   integration tests against live infra
+#   bench-*  benchmarks
 
-ch01:
-	@echo "Chapter 01: Trade-Offs — base server (postgres + redis)"
+.PHONY: run-base run-observability run-datamodel run-olap bench-storage \
+        run-encoding run-replication run-partitioning init-shards \
+        run-transactions test-anomalies run-chaos run-consensus test-fencing \
+        run-batch test-batch run-stream run-cqrs run-privacy
+
+run-base:
+	@echo "Trade-offs — base server (postgres + redis)"
 	docker compose up -d postgres redis
 	go run ./cmd/server
 
-ch02:
-	@echo "Chapter 02: Non-Functional Requirements — with Prometheus + Grafana"
+run-observability:
+	@echo "Non-functional requirements — with Prometheus + Grafana"
 	docker compose up -d postgres redis
 	docker compose --profile observability up -d
 	go run ./cmd/server
 
-ch03:
-	@echo "Chapter 03: Data Models — PostgreSQL events API"
+run-datamodel:
+	@echo "Data models — PostgreSQL events API"
 	docker compose up -d postgres redis
 	go run ./cmd/server
 
-ch04:
-	@echo "Chapter 04: Storage & Retrieval — with ClickHouse"
+run-olap:
+	@echo "Storage & retrieval — with ClickHouse"
 	docker compose up -d postgres redis
 	docker compose --profile olap up -d
 	go run ./cmd/server
 
-ch04-benchmark:
-	@echo "Chapter 04: OLTP vs OLAP — same aggregation in Postgres vs ClickHouse"
+bench-storage:
+	@echo "OLTP vs OLAP — same aggregation in Postgres vs ClickHouse"
 	@echo "Requires the olap profile and seeded events. Find a tenant:"
 	@echo "  docker exec nexus-postgres psql -U nexus -c 'SELECT id FROM tenants LIMIT 1;'"
 	go run ./cmd/storage-benchmark -tenant $${TENANT:?set TENANT=<id> or use the SELECT above}
 
-ch05:
-	@echo "Chapter 05: Encoding — with Kafka + Schema Registry"
+run-encoding:
+	@echo "Schema evolution — with Kafka + Schema Registry"
 	docker compose up -d postgres redis
 	docker compose --profile streaming up -d
 	go run ./cmd/server
 
-ch06:
-	@echo "Chapter 06: Replication — with read replica"
+run-replication:
+	@echo "Replication — with read replica"
 	docker compose up -d postgres redis
 	docker compose --profile replication up -d
 	go run ./cmd/server
 
-ch07:
-	@echo "Chapter 07: Sharding — shard router"
+run-partitioning:
+	@echo "Partitioning — shard router"
 	docker compose up -d postgres redis
 	go run ./cmd/server
 
-ch07-init-shards:
-	@echo "Chapter 07: create per-shard databases (idempotent — safe to re-run)"
+init-shards:
+	@echo "Partitioning: create per-shard databases (idempotent — safe to re-run)"
 	docker compose up -d postgres
 	@for n in 0 1 2 3; do \
 		docker exec nexus-postgres psql -U nexus -d postgres \
@@ -123,8 +131,8 @@ ch07-init-shards:
 	@echo "  SHARD_DSN_TEMPLATE=postgres://nexus:nexus_secret@localhost:5432/nexus?sslmode=disable \\"
 	@echo "      go run ./cmd/server"
 
-ch08:
-	@echo "Chapter 08: Transactions — Temporal workflow + transactional outbox"
+run-transactions:
+	@echo "Transactions — Temporal workflow + transactional outbox"
 	@echo "Streaming profile is required: the outbox worker publishes billing_records"
 	@echo "to Kafka. Without it the outbox loop logs publish errors forever."
 	docker compose up -d postgres redis
@@ -132,8 +140,8 @@ ch08:
 	docker compose --profile streaming up -d
 	go run ./cmd/server
 
-ch08-anomalies:
-	@echo "Chapter 08: Transaction anomaly demos + outbox integration"
+test-anomalies:
+	@echo "Transaction anomaly demos + outbox integration"
 	@echo "Requires postgres running. Reproduces lost-update and write-skew"
 	@echo "anomalies, then asserts the outbox pattern: workflow leaves rows"
 	@echo "outbox_sent_at=NULL, only the worker marks them sent (post-publish)."
@@ -143,21 +151,21 @@ ch08-anomalies:
 	        ./internal/transactions/anomalies/... \
 	        ./internal/billing/outbox/...
 
-ch09:
-	@echo "Chapter 09: Distributed Trouble — circuit breakers + chaos toggles"
+run-chaos:
+	@echo "Failure in distributed systems — circuit breakers + chaos toggles"
 	@echo "Streaming profile lets the chaos drop_publish toggle demonstrate"
 	@echo "asymmetric failure (DB commits, Kafka consumer sees nothing)."
 	docker compose up -d postgres redis
 	docker compose --profile streaming up -d
 	go run ./cmd/server
 
-ch10:
-	@echo "Chapter 10: Consistency — leader election + fencing tokens"
+run-consensus:
+	@echo "Consistency & consensus — leader election + fencing tokens"
 	docker compose up -d postgres redis
 	go run ./cmd/server
 
-ch10-fencing:
-	@echo "Chapter 10: Live-Redis integration tests for fencing tokens"
+test-fencing:
+	@echo "Live-Redis integration tests for fencing tokens"
 	@echo "Proves: token strictly increases across acquisitions, losing"
 	@echo "acquisitions don't consume tokens, stale leader writes are fenced off,"
 	@echo "renew does not advance the token."
@@ -165,21 +173,21 @@ ch10-fencing:
 	REDIS_DSN=redis://localhost:6379/0 \
 	    go test -tags=integration -v -count=1 ./internal/election/...
 
-ch11:
-	@echo "Chapter 11: Batch Processing — aggregate events to ClickHouse"
+run-batch:
+	@echo "Batch processing — aggregate events to ClickHouse"
 	docker compose up -d postgres redis
 	docker compose --profile olap up -d
 	go run ./cmd/batch-aggregator
 
-ch11-verify:
-	@echo "Chapter 11: integration tests covering idempotent re-run + Validate + drift detection"
-	@echo "Requires postgres + clickhouse running (make ch11 brings them up)."
+test-batch:
+	@echo "Integration tests covering idempotent re-run + Validate + drift detection"
+	@echo "Requires postgres + clickhouse running (make run-batch brings them up)."
 	POSTGRES_DSN=postgres://nexus:nexus_secret@localhost:5432/nexus?sslmode=disable \
 	CLICKHOUSE_DSN=clickhouse://nexus:nexus_secret@localhost:9000/nexus \
 	    go test -tags=integration -v -count=1 ./internal/batch/...
 
-ch12:
-	@echo "Chapter 12: Stream Processing — Kafka consumer + tumbling windows"
+run-stream:
+	@echo "Stream processing — Kafka consumer + tumbling windows"
 	@echo "This target runs the stream-processor binary. To see the SSE"
 	@echo "live-stats endpoint, also run 'make run' in another terminal —"
 	@echo "the processor populates Redis windows, the server streams them."
@@ -187,13 +195,13 @@ ch12:
 	docker compose --profile streaming up -d
 	go run ./cmd/stream-processor
 
-ch13:
-	@echo "Chapter 13: Streaming Philosophy — CQRS event store"
+run-cqrs:
+	@echo "Event sourcing — CQRS event store"
 	docker compose up -d postgres redis
 	go run ./cmd/server
 
-ch14:
-	@echo "Chapter 14: Ethics — GDPR endpoints + audit trail + PII masking"
+run-privacy:
+	@echo "Privacy, erasure & audit — GDPR endpoints + audit trail + PII masking"
 	@echo "Observability profile lets you verify the Prometheus-label fix:"
 	@echo "request labels use chi route patterns, never raw paths (no PII)."
 	docker compose up -d postgres redis

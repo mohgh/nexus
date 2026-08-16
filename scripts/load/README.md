@@ -17,7 +17,7 @@ against an SLO, not just slow.
 ## Run
 
 ```bash
-make ch02            # bring up postgres + redis + observability + server
+make run-observability   # bring up postgres + redis + observability + server
 make load-baseline   # 20 VUs / 3 min — asserts SLO compliance
 make load-stress     # 50 VUs / 6 min — explores capacity, soft thresholds
 ```
