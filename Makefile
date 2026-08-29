@@ -1,4 +1,4 @@
-.PHONY: run build test lint docker-up docker-down migrate-up migrate-down seed
+.PHONY: run build test test-race lint docker-up docker-down migrate-up migrate-down seed
 
 # ─── Development ──────────────────────────────────────────────────────────────
 run:
@@ -13,7 +13,15 @@ build:
 	go build -o bin/storage-benchmark ./cmd/storage-benchmark
 
 test:
-	go test ./... -v -race
+	go test ./... -v
+
+# The race detector requires cgo, which requires a C compiler on PATH
+# (gcc/clang; on Windows, mingw-w64). Kept as a separate target so plain
+# `make test` works out of the box everywhere. This project is
+# concurrency-heavy — run this before trusting a change to the stream,
+# projection, election, or idempotency paths.
+test-race:
+	CGO_ENABLED=1 go test ./... -v -race
 
 lint:
 	golangci-lint run ./...

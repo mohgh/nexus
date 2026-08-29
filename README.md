@@ -79,6 +79,10 @@ reject you. It is the credential you mint per-tenant keys with; see `.env.exampl
 live services — including all of `internal/transactions`, where the isolation-level
 anomalies live. Run those via `make test-fencing`, `make test-batch`, `make test-anomalies`.
 
+`make test-race` runs the same suite under the race detector. It needs cgo and a C
+compiler on `PATH` (gcc/clang; mingw-w64 on Windows), which is why it is a separate
+target rather than the default.
+
 `make docker-up-all` brings up the full stack including Kafka UI, schema registry and the
 Temporal UI. `make load-baseline` and `make load-stress` drive the SLO dashboards.
 
