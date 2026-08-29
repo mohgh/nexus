@@ -94,12 +94,35 @@ chaos.EventRepository          ← fault injection (outermost)
               └── ReplicaPool           ← primary/replica routing + LSN capture
 ```
 
-Chaos is outermost **on purpose** (`main.go:160-163`): a 15s injected delay exceeds the
-inner 5s timeout and trips the breaker, while a 4s delay does not. That's the slow-vs-dead
-demo, and it only works in this order. `main.go:250-264` re-applies *both* wrappers when
-sharded mode swaps the repo — the comment records that forgetting the chaos wrap was a
-real bug where `/api/v1/chaos` kept mutating state while the toggles silently stopped
-affecting writes.
+Chaos is outermost, and the comment at `main.go:160-163` explains that ordering with a
+claim that does not hold: *"a 15s injected delay (longer than the inner 5s repo timeout)
+trips the breaker; a 4s delay does not."*
+
+**Verified false.** Because chaos wraps *around* resilience, `MaybeDelayDB` sleeps before
+the breaker is ever entered, so the 5s timeout never covers the injected delay — it only
+covers the (fast) Postgres call underneath. Measured on the live stack:
+
+| Injected delay | Result | Breaker failures |
+|---|---|---|
+| 4s | HTTP 200 in 5s | 0 |
+| **7s** (> the 5s timeout) | **HTTP 200 in 7s** | **0** |
+| 15s | HTTP 500 in 10s | 1 |
+
+7s exceeds the 5s timeout and still succeeds, which falsifies the stated mechanism. The
+15s case fails only because chi's outer `Timeout(10s)` (`router.go:364`) cancels the
+request context; the breaker then records a *fast* inner call failing with
+`context canceled`. So the real boundary is 10s and belongs to the HTTP layer, not 5s at
+the repository layer.
+
+The deeper point is the one worth keeping: **a decorator can only inject faults into the
+layers below it.** Injecting above the breaker means the breaker cannot observe the fault.
+With `error_rate=100` the effect is starker still — `MaybeError` returns before `inner` is
+called, so the breaker sees no requests at all and reports `closed` while every request
+fails.
+
+`main.go:250-264` re-applies *both* wrappers when sharded mode swaps the repo — the comment
+records that forgetting the chaos wrap was a real bug where `/api/v1/chaos` kept mutating
+state while the toggles silently stopped affecting writes.
 
 ### 2e. The write
 
