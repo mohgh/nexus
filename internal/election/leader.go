@@ -90,6 +90,15 @@ func NewElector(client *redis.Client, role, nodeID string) *Elector {
 // Returns the new fencing token on acquisition, or 0 if the lease is
 // held by another node. The INCR only happens when we win the race, so
 // the token counter stays clean across many losing acquisitions.
+//
+// Note that the gate is a plain EXISTS, not a compare against our own
+// node ID: a node cannot re-acquire a lease it is still the physical
+// holder of. That is deliberate. If we stopped being able to confirm
+// the lease (a failed renew), the honest recovery is to let the lease
+// lapse on its TTL and come back with a *fresh, higher* fencing token,
+// rather than to quietly resume under the old one. The cost is at most
+// one TTL of idleness; the benefit is that the downstream can always
+// tell the two epochs apart.
 var acquireScript = redis.NewScript(`
 if redis.call("EXISTS", KEYS[1]) == 1 then
     return 0
@@ -113,6 +122,10 @@ func (e *Elector) TryAcquire(ctx context.Context) (bool, error) {
 		e.nodeID, ttlMs,
 	).Int64()
 	if err != nil {
+		// We could not reach Redis, so we do not know who holds the
+		// lease. See the comment in Renew: "cannot tell" collapses to
+		// "not leader".
+		e.isLeader.Store(false)
 		return false, fmt.Errorf("election: acquire: %w", err)
 	}
 	if token == 0 {
@@ -152,6 +165,20 @@ func (e *Elector) Renew(ctx context.Context) (bool, error) {
 		expected, ttlMs,
 	).Int()
 	if err != nil {
+		// Leadership is a three-state question — leader, not leader,
+		// *cannot tell* — and isLeader is a boolean, so "cannot tell"
+		// has to collapse into one of the two. It must collapse to
+		// "not leader": that is the only always-safe answer, because
+		// a node that wrongly believes it is still the leader keeps
+		// renewing a lease it is no longer doing any work under, and
+		// blocks every other node from taking over.
+		//
+		// Leaving the flag set here was a zombie-leader bug: a single
+		// transient Redis error made the node hold the lease forever
+		// while running nothing. Clearing it costs at most one lease
+		// TTL of leadership after a hiccup, which is exactly what the
+		// TTL is for.
+		e.isLeader.Store(false)
 		return false, fmt.Errorf("election: renew: %w", err)
 	}
 	ok := result == 1
@@ -252,8 +279,54 @@ func (e *Elector) CurrentFencingToken(ctx context.Context) (int64, error) {
 //  3. The function should periodically check IsLeader/FencingToken
 //     before acting on shared state, or pass the token to the
 //     downstream so the downstream can fence stale writes.
+//
+// fn is restarted if it returns while this node is still the leader:
+// holding the lease while doing no work is the worst of both worlds,
+// since it also stops every other node from picking the work up.
+//
+// The loop has no logger by design (the Elector takes none), so a
+// failed renew is not reported anywhere — but it is not *ignored*
+// either: an errored renew is treated as loss of leadership, which is
+// the part that matters for correctness.
 func (e *Elector) RunAsLeader(ctx context.Context, fn func(ctx context.Context)) {
-	var cancel context.CancelFunc
+	// cancel and workDone track the currently running work goroutine.
+	// workDone is closed by that goroutine when fn returns, which is
+	// how the loop notices a work function that exited on its own.
+	var (
+		cancel   context.CancelFunc
+		workDone chan struct{}
+	)
+
+	stopWork := func() {
+		if cancel != nil {
+			cancel()
+			cancel = nil
+		}
+		workDone = nil
+	}
+
+	startWork := func() {
+		leaderCtx, c := context.WithCancel(ctx)
+		done := make(chan struct{})
+		cancel, workDone = c, done
+		go func() {
+			defer close(done)
+			fn(leaderCtx)
+		}()
+	}
+
+	// workRunning reports whether the work goroutine is still alive.
+	workRunning := func() bool {
+		if workDone == nil {
+			return false
+		}
+		select {
+		case <-workDone:
+			return false
+		default:
+			return true
+		}
+	}
 
 	ticker := time.NewTicker(defaultRenewEvery)
 	defer ticker.Stop()
@@ -261,25 +334,42 @@ func (e *Elector) RunAsLeader(ctx context.Context, fn func(ctx context.Context))
 	for {
 		select {
 		case <-ctx.Done():
-			if cancel != nil {
-				cancel()
-			}
+			stopWork()
 			_ = e.Release(context.Background())
 			return
 
 		case <-ticker.C:
 			if e.IsLeader() {
-				ok, _ := e.Renew(ctx)
-				if !ok && cancel != nil {
-					cancel()
-					cancel = nil
+				// The error is folded into the decision rather than
+				// discarded: a renew that failed tells us nothing
+				// about who holds the lease, so it must not count as
+				// "still leader". Renew has already cleared the
+				// isLeader flag in that case, so the next tick goes
+				// down the TryAcquire branch instead of renewing a
+				// lease we can no longer vouch for.
+				ok, err := e.Renew(ctx)
+				if err != nil || !ok {
+					stopWork()
+					continue
+				}
+				if !workRunning() {
+					// Still leader, but fn returned on its own
+					// (e.g. the outbox worker exited with an error).
+					// Start a fresh one; the ticker paces the retry.
+					stopWork()
+					startWork()
 				}
 			} else {
-				ok, _ := e.TryAcquire(ctx)
-				if ok {
-					var leaderCtx context.Context
-					leaderCtx, cancel = context.WithCancel(ctx)
-					go fn(leaderCtx)
+				// TryAcquire reports (false, nil) while the key still
+				// exists — including the case where this very node is
+				// still the physical holder of a lease it has stopped
+				// vouching for. That lease then lapses on its TTL and
+				// a later tick wins it back with a fresh fencing
+				// token. We deliberately do not Release() it here:
+				// see the note on the acquire script.
+				if ok, _ := e.TryAcquire(ctx); ok {
+					stopWork()
+					startWork()
 				}
 			}
 		}
