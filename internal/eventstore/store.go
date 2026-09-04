@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -35,8 +36,14 @@ type StoredEvent struct {
 }
 
 // Store is an append-only event store backed by PostgreSQL.
+//
+// A Store carries a small amount of per-process state: the
+// transaction-visibility horizon (see visibilityHorizon) that keeps
+// catch-up readers from stepping over events that have been assigned
+// a stream_position but are not committed yet.
 type Store struct {
 	pool *pgxpool.Pool
+	hz   visibilityHorizon
 }
 
 // NewStore creates an event store using the given PostgreSQL pool.
@@ -89,9 +96,14 @@ func (s *Store) ReadStream(ctx context.Context, streamName string) ([]StoredEven
 	return scanStoredEvents(rows)
 }
 
-// HeadPosition returns the highest stream_position written, or 0
-// if the event store is empty. Used by the projection runner to
-// report lag (head - last_applied).
+// HeadPosition returns the highest stream_position visible to this
+// snapshot, or 0 if the event store is empty.
+//
+// Careful: this is the raw MAX. It is NOT a safe read boundary -- a
+// concurrent transaction can hold a lower stream_position that has not
+// committed yet, so positions below this head can still appear later.
+// Use SafeHeadPosition for "how far may I consume?" and this one only
+// for "how much has been written?" reporting.
 func (s *Store) HeadPosition(ctx context.Context) (int64, error) {
 	var head int64
 	err := s.pool.QueryRow(ctx,
@@ -103,14 +115,47 @@ func (s *Store) HeadPosition(ctx context.Context) (int64, error) {
 	return head, nil
 }
 
-// ReadAllFrom returns events from all streams starting after the given position.
-// Projections use this to catch up: "give me everything after position X."
+// ReadAllFrom returns events from all streams starting after the given
+// position. Projections use this to catch up: "give me everything after
+// position X."
 //
-// Limit prevents unbounded reads during catch-up of a large backlog.
+// ─── Why this is not just `WHERE stream_position > $1` ────────────────────
+//
+// stream_position comes from a BIGSERIAL. A sequence hands out numbers at
+// INSERT time, but rows become visible at COMMIT time, and those two orders
+// are not the same. A slow transaction can hold position 6 while a fast one
+// commits position 7. A reader that asks for "everything I can see after 5",
+// gets [7], and moves its bookmark to 7 will never read 6 once it commits:
+// silent, permanent event loss — and with a lag of 0, because
+// MAX(stream_position) also says 7.
+//
+// The sequence is not the ordering authority; the commit order is, and the
+// sequence only approximates it. So this method returns a prefix that is
+// safe to consume and stops at the first position that is unaccounted for:
+//
+//  1. Contiguity. Rows are returned only while they form an unbroken run
+//     from afterPosition. If position 6 is missing, [7, 8, 9] is withheld
+//     until 6 commits (or is proven dead, below). This costs nothing in the
+//     common case: with no writer in flight the run is dense to the head.
+//
+//  2. Settled horizon. A gap left by a rolled back insert is permanent, and
+//     rule 1 alone would stall on it forever. visibilityHorizon tracks the
+//     position below which every transaction that could have taken a number
+//     has finished, so dead gaps are stepped over once proven dead.
+//
+// Consequence for callers: a short (or empty) batch no longer implies "the
+// store is drained", only "nothing further is safe to hand you yet". A
+// poller simply comes back on the next tick. Limit still bounds the read.
 func (s *Store) ReadAllFrom(ctx context.Context, afterPosition int64, limit int) ([]StoredEvent, error) {
 	if limit <= 0 || limit > 10000 {
 		limit = 1000
 	}
+
+	settled, err := s.refreshHorizon(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	rows, err := s.pool.Query(ctx,
 		`SELECT stream_position, stream_name, event_type, data, metadata, occurred_at
 		 FROM events_store
@@ -123,7 +168,164 @@ func (s *Store) ReadAllFrom(ctx context.Context, afterPosition int64, limit int)
 		return nil, fmt.Errorf("eventstore: read all from %d: %w", afterPosition, err)
 	}
 	defer rows.Close()
-	return scanStoredEvents(rows)
+	events, err := scanStoredEvents(rows)
+	if err != nil {
+		return nil, err
+	}
+	return trimToVisibleRun(events, afterPosition, settled), nil
+}
+
+// SafeHeadPosition reports the highest position a consumer sitting at
+// afterPosition may advance to right now: every position in
+// (afterPosition, result] is either visible or proven never to arrive.
+//
+// This is the number to compare a projection against when asking "is the
+// read model keeping up?". HeadPosition minus SafeHeadPosition is the part
+// of the log that exists but sits behind the visibility horizon — backlog
+// nobody can act on yet.
+func (s *Store) SafeHeadPosition(ctx context.Context, afterPosition int64) (int64, error) {
+	settled, err := s.refreshHorizon(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	// End of the unbroken run of positions starting at afterPosition+1.
+	// row_number() advances by exactly 1 per row while stream_position
+	// advances by at least 1, so the equality holds exactly on the
+	// contiguous prefix and never again after the first gap.
+	var runEnd int64
+	err = s.pool.QueryRow(ctx,
+		`SELECT COALESCE(MAX(stream_position), $1)
+		   FROM (SELECT stream_position,
+		                row_number() OVER (ORDER BY stream_position) AS rn
+		           FROM events_store
+		          WHERE stream_position > $1
+		          ORDER BY stream_position
+		          LIMIT $2) t
+		  WHERE stream_position = $1 + rn`,
+		afterPosition, horizonScanLimit,
+	).Scan(&runEnd)
+	if err != nil {
+		return 0, fmt.Errorf("eventstore: safe head after %d: %w", afterPosition, err)
+	}
+
+	// The settled horizon can sit above the last visible row (the tail of
+	// the sequence may have been rolled back), so clamp it before use.
+	if maxPos := s.hz.lastMax(); settled > maxPos {
+		settled = maxPos
+	}
+	if settled > runEnd {
+		return settled, nil
+	}
+	return runEnd, nil
+}
+
+// horizonScanLimit bounds the contiguity scan in SafeHeadPosition so that a
+// multi-million row event store does not turn a lag query into a table scan.
+// A consumer further behind than this is reported as "at least this far
+// behind", which is all a lag gauge needs.
+const horizonScanLimit = 10000
+
+// trimToVisibleRun cuts events at the first position that is neither the
+// next one in sequence nor below the settled horizon. events must be sorted
+// ascending and contain only positions greater than after.
+func trimToVisibleRun(events []StoredEvent, after, settled int64) []StoredEvent {
+	prev := after
+	for i, e := range events {
+		if e.StreamPosition != prev+1 && e.StreamPosition > settled {
+			return events[:i]
+		}
+		prev = e.StreamPosition
+	}
+	return events
+}
+
+// ─── Transaction-visibility horizon ───────────────────────────────────────
+
+// visibilityHorizon answers "below which stream_position has every
+// transaction that could have taken a number already finished?"
+//
+// The mechanism is Postgres' snapshot horizon. pg_current_snapshot()
+// reports xmin (the oldest transaction still running) and xmax (one past
+// the newest transaction id handed out). Sample (maxPos, xmax) at time T:
+// every position <= maxPos was drawn before T, so it belongs either to a
+// transaction that had already committed (we can see it) or to one still
+// running at T — and every one of those has an id below xmax. Once a later
+// sample reports xmin >= that xmax, all of them have ended: those that
+// committed are visible, those that aborted never will be. maxPos is then
+// settled for good.
+//
+// The state is per-process and starts empty, which is safe: an unproven
+// horizon of 0 simply leaves readers on strict contiguity.
+type visibilityHorizon struct {
+	mu sync.Mutex
+
+	settled int64 // every position <= settled is visible or dead
+	maxPos  int64 // newest position seen by any sample
+
+	// One pending sample at a time. Re-sampling on every call would keep
+	// pushing the deadline out under a steady write stream, and the
+	// horizon would never advance.
+	candidate     int64
+	candidateXmax int64
+}
+
+// observe folds one (maxPos, xmin, xmax) sample into the horizon and
+// returns the settled position.
+func (h *visibilityHorizon) observe(maxPos, xmin, xmax int64) int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if maxPos > h.maxPos {
+		h.maxPos = maxPos
+	}
+
+	// The pending sample matures: every transaction that was running when
+	// it was taken has since ended.
+	if h.candidate > h.settled && xmin >= h.candidateXmax {
+		h.settled = h.candidate
+	}
+
+	// Fast path: xmin == xmax means no write transaction is in flight at
+	// all, so nothing can be holding a number back.
+	if xmin >= xmax && maxPos > h.settled {
+		h.settled = maxPos
+	}
+
+	if h.candidate <= h.settled && maxPos > h.settled {
+		h.candidate = maxPos
+		h.candidateXmax = xmax
+	}
+	return h.settled
+}
+
+func (h *visibilityHorizon) lastMax() int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.maxPos
+}
+
+// refreshHorizon samples MAX(stream_position) and the snapshot bounds in a
+// single statement — one statement, one snapshot, so the two agree — and
+// returns the settled horizon.
+//
+// pg_snapshot_xmin/xmax return xid8: 64-bit and epoch-extended, so unlike
+// the 32-bit xid in a row's system columns they compare correctly across
+// wraparound. That is why the horizon is derived from snapshot bounds
+// rather than from each row's own xmin.
+func (s *Store) refreshHorizon(ctx context.Context) (int64, error) {
+	var maxPos, xmin, xmax int64
+	err := s.pool.QueryRow(ctx,
+		`WITH snap AS (SELECT pg_current_snapshot() AS s)
+		 SELECT COALESCE((SELECT MAX(stream_position) FROM events_store), 0),
+		        pg_snapshot_xmin(s)::text::bigint,
+		        pg_snapshot_xmax(s)::text::bigint
+		   FROM snap`,
+	).Scan(&maxPos, &xmin, &xmax)
+	if err != nil {
+		return 0, fmt.Errorf("eventstore: visibility horizon: %w", err)
+	}
+	return s.hz.observe(maxPos, xmin, xmax), nil
 }
 
 func scanStoredEvents(rows interface {

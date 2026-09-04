@@ -26,9 +26,29 @@ import (
 // without standing up Postgres. Production wires the concrete
 // *eventstore.Store; nothing in the Runner's hot path touches
 // anything outside this interface.
+//
+// Contract, and it is the load-bearing part of this package: a
+// stream_position is assigned at INSERT time but becomes visible at
+// COMMIT time, so "the highest position I can see" is not the same
+// as "the highest position that exists below which nothing more can
+// appear". An implementation of ReadAllFrom MUST NOT return an event
+// whose position sits above a gap that a still-running transaction
+// could yet fill — the Runner advances its bookmark to the last event
+// it applied, so anything handed over a gap is skipped permanently.
+// Returning a short batch (or none) is always allowed and simply
+// means "nothing more is safe yet"; the Runner comes back next tick.
 type EventReader interface {
 	ReadAllFrom(ctx context.Context, after int64, limit int) ([]eventstore.StoredEvent, error)
+
+	// HeadPosition is the raw MAX(stream_position): everything written,
+	// including events that are not yet safe to consume.
 	HeadPosition(ctx context.Context) (int64, error)
+
+	// SafeHeadPosition is the highest position a consumer sitting at
+	// `after` may advance to right now. It is relative to `after`
+	// because safety is a property of the run of positions between the
+	// consumer and the head, not of the head alone.
+	SafeHeadPosition(ctx context.Context, after int64) (int64, error)
 }
 
 type Runner struct {
@@ -131,10 +151,17 @@ func (r *Runner) sweep(ctx context.Context) {
 	}
 }
 
-// catchUp drains as many events as available, batchSize at a time,
-// from the projection's current position. Stops when the store
-// returns fewer events than the batch size — that means we've
-// drained.
+// catchUp drains as many events as the store is willing to hand
+// over, batchSize at a time, from the projection's current position.
+//
+// Stops when the store returns fewer events than the batch size.
+// Note what that does and does not mean: it means "nothing more is
+// available to me right now", not "the log is drained". The store
+// withholds events that sit above a position a still-uncommitted
+// transaction may yet fill (see EventReader), so a sweep can end
+// early with visible events left in the table. That is the point —
+// the alternative is advancing the bookmark past them forever. The
+// gap resolves on a later tick, usually the very next one.
 func (r *Runner) catchUp(ctx context.Context, p Projection) error {
 	for {
 		if ctx.Err() != nil {
@@ -161,21 +188,41 @@ func (r *Runner) catchUp(ctx context.Context, p Projection) error {
 	}
 }
 
-// Lag returns the difference between the event store's current
-// highest position and each projection's position. Used by the
-// admin endpoint to surface "how far behind is each read model?"
+// Lag describes how far behind the event store one projection is.
+// Used by the admin endpoint to surface "how far behind is each read
+// model?"
+//
+// Two heads, deliberately. HeadPosition is everything written;
+// SafeHeadPosition is how far this projection is currently allowed to
+// advance. Splitting Lag the same way is what makes a stall
+// diagnosable: Lag > 0 with ReadyLag == 0 means the runner is not
+// behind at all, it is blocked behind an uncommitted writer holding a
+// position — nothing to page anyone about unless it persists. Lag > 0
+// with ReadyLag > 0 means the runner genuinely has work outstanding.
+//
+// Before the visibility fix this endpoint could not say either, because
+// the runner would step over the uncommitted writer's position and then
+// report a comfortable lag of 0 while the event was lost for good.
 type Lag struct {
 	ProjectionName string `json:"projection"`
 	LastPosition   int64  `json:"last_position"`
 	HeadPosition   int64  `json:"head_position"`
-	Lag            int64  `json:"lag"`
+	// SafeHeadPosition is the highest position this projection may
+	// currently advance to. It trails HeadPosition while a writer holds
+	// an uncommitted position below the head.
+	SafeHeadPosition int64 `json:"safe_head_position"`
+	Lag              int64 `json:"lag"`
+	// ReadyLag is the part of Lag the runner can act on right now.
+	ReadyLag int64 `json:"ready_lag"`
 }
 
 // LagFor reports the lag for each projection at this moment. The
 // HeadPosition is read once and reused so the numbers are
 // internally consistent (otherwise a projection that just advanced
 // while another was being read could show a higher position than
-// the head we read earlier — confusing in a single snapshot).
+// the head we read earlier — confusing in a single snapshot). The
+// safe head, by contrast, is per projection: it depends on where that
+// projection is sitting, so it cannot be hoisted out of the loop.
 func (r *Runner) LagFor(ctx context.Context) ([]Lag, error) {
 	head, err := r.store.HeadPosition(ctx)
 	if err != nil {
@@ -184,16 +231,31 @@ func (r *Runner) LagFor(ctx context.Context) ([]Lag, error) {
 	out := make([]Lag, 0, len(r.projections))
 	for _, p := range r.projections {
 		last := p.LastPosition()
-		lag := head - last
-		if lag < 0 {
-			lag = 0
+
+		safeHead, err := r.store.SafeHeadPosition(ctx, last)
+		if err != nil {
+			return nil, fmt.Errorf("safe head position: %w", err)
 		}
+		if safeHead > head {
+			// Only reachable if a write landed between the two reads.
+			safeHead = head
+		}
+
 		out = append(out, Lag{
-			ProjectionName: p.Name(),
-			LastPosition:   last,
-			HeadPosition:   head,
-			Lag:            lag,
+			ProjectionName:   p.Name(),
+			LastPosition:     last,
+			HeadPosition:     head,
+			SafeHeadPosition: safeHead,
+			Lag:              nonNegative(head - last),
+			ReadyLag:         nonNegative(safeHead - last),
 		})
 	}
 	return out, nil
+}
+
+func nonNegative(v int64) int64 {
+	if v < 0 {
+		return 0
+	}
+	return v
 }
