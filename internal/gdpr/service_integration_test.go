@@ -312,3 +312,284 @@ func TestExportAnonymise_404OnMissingTenant(t *testing.T) {
 		t.Fatalf("AnonymiseTenantEvents on missing tenant: got %v, want ErrTenantNotFound", err)
 	}
 }
+
+// ─── Consent withdrawal ──────────────────────────────────────────────────
+
+// TestRevokeConsent_WithNoPriorRecord_TakesEffect is the regression
+// test for "consent withdrawal is a silent no-op".
+//
+// Revoke was a bare `UPDATE ... WHERE tenant_id = $x AND purpose =
+// $y`. With no prior consent row it matched zero rows, and zero rows
+// matched is not an error: the API returned 200, the audit log
+// recorded a consent_revoked entry, and nothing changed. Because
+// ConsentGate treats StateNoRecord as a lenient pass, the tenant
+// whose data was being processed without a recorded legal basis was
+// left with no way to stop it — while the audit trail asserted a
+// withdrawal that had never taken effect.
+func TestRevokeConsent_WithNoPriorRecord_TakesEffect(t *testing.T) {
+	pool := openPool(t)
+	ctx := context.Background()
+
+	// setupTenantWithData seeds consent for "analytics" only, so
+	// "marketing" is the never-consented purpose.
+	tenantID := setupTenantWithData(t, pool)
+	const purpose = "marketing"
+
+	if got := countWhere(t, pool,
+		`SELECT COUNT(*) FROM consent_records WHERE tenant_id = $1 AND purpose = $2`,
+		tenantID, purpose,
+	); got != 0 {
+		t.Fatalf("precondition: expected no %s consent row, got %d", purpose, got)
+	}
+
+	consentStore := consent.NewStore(pool)
+	svc := gdpr.NewService(pool, audit.NewLog(pool), consentStore, zap.NewNop())
+
+	if err := svc.Revoke(ctx, tenantID, purpose); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+
+	// 1. A revocation row must now exist.
+	var granted bool
+	var revokedAt *time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT granted, revoked_at FROM consent_records
+		 WHERE tenant_id = $1 AND purpose = $2`,
+		tenantID, purpose,
+	).Scan(&granted, &revokedAt); err != nil {
+		t.Fatalf("no consent row after revoke (%v).\n"+
+			"This is the regression case — the UPDATE matched zero rows, "+
+			"returned no error, and the withdrawal was a silent no-op.", err)
+	}
+	if granted {
+		t.Fatalf("consent row should be granted=false after revoke")
+	}
+	if revokedAt == nil {
+		t.Fatalf("revoked_at should be set after revoke")
+	}
+
+	// 2. The consent gate must now deny, not pass through. This is
+	//    the property the data subject actually asked for.
+	state, err := consentStore.ConsentState(ctx, tenantID, purpose)
+	if err != nil {
+		t.Fatalf("ConsentState: %v", err)
+	}
+	if state != consent.StateRevoked {
+		t.Fatalf("ConsentState = %d, want StateRevoked (%d); "+
+			"StateNoRecord means ConsentGate keeps letting the request through",
+			state, consent.StateRevoked)
+	}
+
+	// 3. The audit entry is now backed by a real state change.
+	if got := countWhere(t, pool,
+		`SELECT COUNT(*) FROM audit_log
+		 WHERE tenant_id = $1 AND action = 'consent_revoked'`,
+		tenantID,
+	); got < 1 {
+		t.Fatalf("expected a consent_revoked audit entry, got %d", got)
+	}
+}
+
+// TestRevokeConsent_ExistingGrantIsFlippedNotReset checks the other
+// half of the upsert: revoking an existing grant must flip granted
+// to false without rewriting granted_at, which records when consent
+// was originally given.
+func TestRevokeConsent_ExistingGrantIsFlippedNotReset(t *testing.T) {
+	pool := openPool(t)
+	ctx := context.Background()
+
+	tenantID := setupTenantWithData(t, pool) // seeds analytics = granted
+	const purpose = "analytics"
+
+	var grantedAtBefore time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT granted_at FROM consent_records WHERE tenant_id = $1 AND purpose = $2`,
+		tenantID, purpose,
+	).Scan(&grantedAtBefore); err != nil {
+		t.Fatalf("read seeded consent: %v", err)
+	}
+
+	consentStore := consent.NewStore(pool)
+	if err := consentStore.Revoke(ctx, tenantID, consent.Purpose(purpose)); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+
+	if got := countWhere(t, pool,
+		`SELECT COUNT(*) FROM consent_records WHERE tenant_id = $1 AND purpose = $2`,
+		tenantID, purpose,
+	); got != 1 {
+		t.Fatalf("revoke must not duplicate the row, got %d rows", got)
+	}
+
+	var granted bool
+	var grantedAtAfter time.Time
+	var revokedAt *time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT granted, granted_at, revoked_at FROM consent_records
+		 WHERE tenant_id = $1 AND purpose = $2`,
+		tenantID, purpose,
+	).Scan(&granted, &grantedAtAfter, &revokedAt); err != nil {
+		t.Fatalf("read consent after revoke: %v", err)
+	}
+	if granted {
+		t.Fatalf("granted should be false after revoke")
+	}
+	if revokedAt == nil {
+		t.Fatalf("revoked_at should be set after revoke")
+	}
+	if !grantedAtAfter.Equal(grantedAtBefore) {
+		t.Fatalf("granted_at must not be rewritten by a revoke: was %s, now %s",
+			grantedAtBefore, grantedAtAfter)
+	}
+
+	// Revoking twice is a no-op, not an error or a duplicate row.
+	if err := consentStore.Revoke(ctx, tenantID, consent.Purpose(purpose)); err != nil {
+		t.Fatalf("second Revoke: %v", err)
+	}
+	if got := countWhere(t, pool,
+		`SELECT COUNT(*) FROM consent_records WHERE tenant_id = $1 AND purpose = $2`,
+		tenantID, purpose,
+	); got != 1 {
+		t.Fatalf("repeated revoke must stay idempotent, got %d rows", got)
+	}
+}
+
+// ─── Anonymisation counters and collateral damage ────────────────────────
+
+// insertEvent adds one event row for the tenant and returns its id.
+func insertEvent(t *testing.T, pool *pgxpool.Pool, tenantID, payload string) string {
+	t.Helper()
+	id := uuid.New().String()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO events (id, tenant_id, event_type, payload, value, occurred_at)
+		 VALUES ($1, $2, 'test_event', $3::jsonb, 1, NOW())`,
+		id, tenantID, payload,
+	); err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+	return id
+}
+
+// TestAnonymiseTenantEvents_CountsOnlyRedactedRows is the regression
+// test for the 3.5x over-report. out.anonymised++ sat outside the
+// "no categories matched" branch, so events_anonymised counted every
+// row SCANNED — the API reported 1671 anonymised against 477 rows
+// that actually contained [REDACTED]. The sibling events_store pass
+// counted correctly, so one JSON response carried two identically
+// shaped numbers with two different meanings.
+func TestAnonymiseTenantEvents_CountsOnlyRedactedRows(t *testing.T) {
+	pool := openPool(t)
+	ctx := context.Background()
+
+	tenantID := setupTenantWithData(t, pool) // seeds 1 clean event
+	insertEvent(t, pool, tenantID, `{"page":"/pricing","duration_ms":142}`)
+	insertEvent(t, pool, tenantID, `{"page":"/checkout","order_ref":"2024-0007711"}`)
+	piiID := insertEvent(t, pool, tenantID, `{"email":"alice@example.com"}`)
+
+	svc := gdpr.NewService(pool, audit.NewLog(pool), consent.NewStore(pool), zap.NewNop())
+
+	result, err := svc.AnonymiseTenantEvents(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("AnonymiseTenantEvents: %v", err)
+	}
+
+	if result.EventsScanned != 4 {
+		t.Fatalf("EventsScanned = %d, want 4 (scanned keeps meaning scanned)", result.EventsScanned)
+	}
+	if result.EventsAnonymised != 1 {
+		t.Fatalf("EventsAnonymised = %d, want 1.\n"+
+			"Only one of the four rows contained PII; the counter was reporting "+
+			"rows scanned, not rows redacted (%+v)", result.EventsAnonymised, result)
+	}
+
+	// Cross-check the counter against the database, which is what
+	// made the original over-report visible in production.
+	redacted := countWhere(t, pool,
+		`SELECT COUNT(*) FROM events
+		 WHERE tenant_id = $1 AND position('[REDACTED]' in payload::text) > 0`,
+		tenantID,
+	)
+	if redacted != result.EventsAnonymised {
+		t.Fatalf("EventsAnonymised = %d but %d rows actually carry [REDACTED]",
+			result.EventsAnonymised, redacted)
+	}
+
+	// All four rows are still marked processed, PII or not.
+	if got := countWhere(t, pool,
+		`SELECT COUNT(*) FROM events WHERE tenant_id = $1 AND pii_erased = TRUE`,
+		tenantID,
+	); got != 4 {
+		t.Fatalf("all scanned rows should be marked pii_erased, got %d/4", got)
+	}
+
+	var piiPayload []byte
+	if err := pool.QueryRow(ctx, `SELECT payload FROM events WHERE id = $1`, piiID).
+		Scan(&piiPayload); err != nil {
+		t.Fatalf("read redacted row: %v", err)
+	}
+	if !strings.Contains(string(piiPayload), "[REDACTED]") {
+		t.Fatalf("the one PII row should have been redacted, got %s", piiPayload)
+	}
+}
+
+// TestAnonymiseTenantEvents_PreservesBusinessIdentifiers is the
+// end-to-end half of the masker regression. The anonymisation pass
+// writes masked bytes back over events and events_store — the source
+// of truth, with no rollback — so a masker false positive is
+// permanent data loss. An order reference like "2024-0007711"
+// matched the old phone regex and was destroyed in place.
+func TestAnonymiseTenantEvents_PreservesBusinessIdentifiers(t *testing.T) {
+	pool := openPool(t)
+	ctx := context.Background()
+
+	tenantID := setupTenantWithData(t, pool)
+	eventID := insertEvent(t, pool, tenantID,
+		`{"order_ref":"2024-0007711","invoice":"INV-2024-0001","email":"alice@example.com"}`)
+
+	streamName := "tenant-" + tenantID
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO events_store (stream_name, event_type, data, occurred_at)
+		 VALUES ($1, 'EventIngested', $2::jsonb, NOW())`,
+		streamName,
+		`{"id":"`+eventID+`","tenant_id":"`+tenantID+`","event_type":"purchase","value":1,`+
+			`"payload":{"order_ref":"2024-0007711","invoice":"INV-2024-0001","email":"alice@example.com"}}`,
+	); err != nil {
+		t.Fatalf("insert events_store: %v", err)
+	}
+
+	svc := gdpr.NewService(pool, audit.NewLog(pool), consent.NewStore(pool), zap.NewNop())
+	if _, err := svc.AnonymiseTenantEvents(ctx, tenantID); err != nil {
+		t.Fatalf("AnonymiseTenantEvents: %v", err)
+	}
+
+	check := func(label string, data []byte) {
+		t.Helper()
+		if strings.Contains(string(data), "alice@example.com") {
+			t.Fatalf("%s: email should have been redacted, got %s", label, data)
+		}
+		if !strings.Contains(string(data), "2024-0007711") {
+			t.Fatalf("%s: the order reference is not PII and must survive anonymisation.\n"+
+				"This is the regression case — the phone regex matched a hyphenated "+
+				"business id and the pass overwrote the source of truth. Got: %s", label, data)
+		}
+		if !strings.Contains(string(data), "INV-2024-0001") {
+			t.Fatalf("%s: the invoice reference must survive anonymisation, got %s", label, data)
+		}
+	}
+
+	var eventsPayload []byte
+	if err := pool.QueryRow(ctx, `SELECT payload FROM events WHERE id = $1`, eventID).
+		Scan(&eventsPayload); err != nil {
+		t.Fatalf("read events row: %v", err)
+	}
+	check("events.payload", eventsPayload)
+
+	var storeData []byte
+	if err := pool.QueryRow(ctx,
+		`SELECT data FROM events_store WHERE stream_name = $1 ORDER BY stream_position DESC LIMIT 1`,
+		streamName,
+	).Scan(&storeData); err != nil {
+		t.Fatalf("read events_store row: %v", err)
+	}
+	check("events_store.data", storeData)
+}

@@ -126,12 +126,18 @@ func ManageConsent(manager ConsentManager) http.HandlerFunc {
 			return
 		}
 
+		// status is set alongside the call rather than derived from the
+		// action, so the two can never drift. Deriving it as req.Action+"ed"
+		// previously rendered "revoke" as "revokeed".
 		var err error
+		var status string
 		switch req.Action {
 		case "grant":
 			err = manager.Grant(r.Context(), tenantID, req.Purpose, req.Version)
+			status = "granted"
 		case "revoke":
 			err = manager.Revoke(r.Context(), tenantID, req.Purpose)
+			status = "revoked"
 		}
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "consent update failed")
@@ -139,7 +145,7 @@ func ManageConsent(manager ConsentManager) http.HandlerFunc {
 		}
 
 		writeJSON(w, http.StatusOK, map[string]string{
-			"status":  req.Action + "ed",
+			"status":  status,
 			"purpose": req.Purpose,
 		})
 	}

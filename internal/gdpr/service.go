@@ -249,6 +249,10 @@ func (s *Service) assertTenantExists(ctx context.Context, tenantID string) error
 // both tables because the audit's regression case was that we
 // anonymised the projection (events) while leaving the canonical
 // log (events_store) untouched.
+//
+// *Scanned counts rows examined; *Anonymised counts rows whose
+// stored bytes actually changed. Both passes use that definition —
+// the events pass previously counted every row it scanned.
 type AnonymiseResult struct {
 	EventsScanned        int `json:"events_scanned"`
 	EventsAnonymised     int `json:"events_anonymised"`
@@ -379,19 +383,26 @@ func (s *Service) anonymiseEventsTable(ctx context.Context, tx pgxQuerier, tenan
 	for _, r := range batch {
 		masked, cats := s.masker.Mask(r.payload)
 		if len(cats) == 0 {
+			// Nothing to redact. The row is still marked so it drops
+			// out of the pending-anonymisation index, but it was NOT
+			// anonymised — incrementing here counted every row
+			// scanned and inflated events_anonymised (1671 reported
+			// against 477 rows actually redacted), while the sibling
+			// events_store pass counted only real redactions. Two
+			// numbers in one response with two different meanings.
 			if _, err := tx.Exec(ctx,
 				`UPDATE events SET pii_erased = TRUE WHERE id = $1`,
 				r.id,
 			); err != nil {
 				return out, fmt.Errorf("gdpr: anonymise events: mark %s: %w", r.id, err)
 			}
-		} else {
-			if _, err := tx.Exec(ctx,
-				`UPDATE events SET payload = $1, pii_erased = TRUE WHERE id = $2`,
-				[]byte(masked), r.id,
-			); err != nil {
-				return out, fmt.Errorf("gdpr: anonymise events: update %s: %w", r.id, err)
-			}
+			continue
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE events SET payload = $1, pii_erased = TRUE WHERE id = $2`,
+			[]byte(masked), r.id,
+		); err != nil {
+			return out, fmt.Errorf("gdpr: anonymise events: update %s: %w", r.id, err)
 		}
 		out.anonymised++
 	}
@@ -399,9 +410,9 @@ func (s *Service) anonymiseEventsTable(ctx context.Context, tx pgxQuerier, tenan
 }
 
 // anonymiseEventStore scrubs the canonical event log. The masker
-// operates on the entire JSONB payload — events_store.data wraps
-// the original event payload, so a single Mask pass over the JSONB
-// bytes catches PII regardless of which JSON field carries it.
+// walks the whole decoded document — events_store.data wraps the
+// original event payload, so a single Mask pass over the envelope
+// catches PII regardless of which nested field carries it.
 func (s *Service) anonymiseEventStore(ctx context.Context, tx pgxQuerier, tenantID string) (anonymisePassResult, error) {
 	streamName := "tenant-" + tenantID
 	rows, err := tx.Query(ctx,

@@ -74,13 +74,37 @@ func (s *Store) Grant(ctx context.Context, tenantID string, purpose Purpose, ver
 }
 
 // Revoke records that a tenant has withdrawn consent for a purpose.
+//
+// This is an upsert, not an UPDATE, and that is deliberate.
+//
+// A bare `UPDATE ... WHERE tenant_id = $x AND purpose = $y` matches
+// zero rows when the tenant never had a consent row, and zero rows
+// matched is not an error in SQL. The caller saw success, the audit
+// log recorded a withdrawal, and nothing changed. Worse, the
+// ConsentGate middleware treats "no record" as a lenient pass —
+// so the tenants whose data was being processed without a recorded
+// legal basis were exactly the tenants who could not stop it.
+//
+// GDPR Art. 7(3) requires withdrawal to be as easy as giving
+// consent, so the alternative fix — returning a not-found error to
+// a data subject who is withdrawing — is the wrong answer: the
+// outcome a withdrawal must produce is "this tenant is recorded as
+// not consenting", which is exactly what an INSERT of granted=false
+// produces. It also flips ConsentState from StateNoRecord (pass) to
+// StateRevoked (deny), which is the point of the call.
+//
+// granted_at is left alone on conflict — it records when consent was
+// originally given, which a withdrawal does not change. On a fresh
+// insert it is set to now only because the column is NOT NULL; the
+// row's meaning is carried by granted=false + revoked_at.
 func (s *Store) Revoke(ctx context.Context, tenantID string, purpose Purpose) error {
 	now := time.Now().UTC()
 	_, err := s.pool.Exec(ctx,
-		`UPDATE consent_records
-		 SET granted = false, revoked_at = $1
-		 WHERE tenant_id = $2 AND purpose = $3`,
-		now, tenantID, string(purpose),
+		`INSERT INTO consent_records (tenant_id, purpose, granted, version, granted_at, revoked_at)
+		 VALUES ($1, $2, false, 1, $3, $3)
+		 ON CONFLICT (tenant_id, purpose)
+		 DO UPDATE SET granted = false, revoked_at = $3`,
+		tenantID, string(purpose), now,
 	)
 	if err != nil {
 		return fmt.Errorf("consent: revoke: %w", err)
