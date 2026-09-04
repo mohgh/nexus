@@ -89,22 +89,60 @@ func TestWindow_WatermarkPersistsAcrossRestart(t *testing.T) {
 	durationLabelLocal := dur.String() // "23s" — matches durationLabel fallback
 	cleanupKeys(t, client, durationLabelLocal)
 
-	// First process: ingest a few events, all in the same bucket.
-	procA := stream.NewWindow(client, dur, 5*time.Second, nil)
-	bucketTime := time.Now().UTC().Truncate(dur)
+	const lateness = 5 * time.Second
+
+	// First process: ingest into a bucket that is genuinely HISTORICAL
+	// by the time procA stops — that is the whole scenario, a bucket
+	// stranded in Redis by a process that died after the stream had
+	// already moved past it.
+	//
+	// Getting this wrong is easy and the earlier version of this test
+	// did: it filled the *current* bucket and then asserted that same
+	// bucket was closed. That can never hold. IsClosed requires
+	//
+	//	watermark >= bucketStart + duration + lateness
+	//
+	// and the watermark is the max event_time seen — which, when every
+	// event you fed in belongs to that bucket, is at most
+	// bucketStart + duration - ε. A bucket can never close itself; only
+	// a later event can close it. So the assertion failed deterministically
+	// (watermark was bucketStart+5s against a required bucketStart+28s)
+	// rather than testing LoadWatermark at all.
+	procA := stream.NewWindow(client, dur, lateness, nil)
+
+	// The stranded bucket: three windows back, so it is comfortably
+	// past bucketStart + duration + lateness once the stream advances.
+	currentBucket := time.Now().UTC().Truncate(dur)
+	bucketTime := currentBucket.Add(-3 * dur)
+
 	if err := procA.Add(ctx, "tenant-X", "page_view", "evt-restart-1", 1, bucketTime.Add(time.Second)); err != nil {
 		t.Fatalf("procA Add 1: %v", err)
 	}
-	maxEventTime := bucketTime.Add(5 * time.Second)
-	if err := procA.Add(ctx, "tenant-X", "page_view", "evt-restart-2", 1, maxEventTime); err != nil {
+	if err := procA.Add(ctx, "tenant-X", "page_view", "evt-restart-2", 1, bucketTime.Add(5*time.Second)); err != nil {
 		t.Fatalf("procA Add 2: %v", err)
+	}
+
+	// The stream then advances into the current window — this is what
+	// pushes the watermark past the historical bucket's close point.
+	// Ordered after the two Adds above so it is the newest event and
+	// therefore not itself routed late.
+	maxEventTime := currentBucket.Add(time.Second)
+	if err := procA.Add(ctx, "tenant-X", "page_view", "evt-restart-3", 1, maxEventTime); err != nil {
+		t.Fatalf("procA Add 3: %v", err)
+	}
+
+	// Sanity on the arithmetic the assertions below depend on: the
+	// stranded bucket must be closable, the current one must not.
+	if closeAt := bucketTime.Add(dur).Add(lateness); maxEventTime.Before(closeAt) {
+		t.Fatalf("test setup is wrong: watermark %v never reaches the historical bucket's close point %v",
+			maxEventTime, closeAt)
 	}
 
 	// Stand up a second aggregator instance — this is "process B,
 	// just started, in-memory watermark = 0." If LoadWatermark
 	// works, calling it should pull the persisted value into B's
 	// in-memory atomic so IsClosed agrees with procA's worldview.
-	procB := stream.NewWindow(client, dur, 5*time.Second, nil)
+	procB := stream.NewWindow(client, dur, lateness, nil)
 	if !procB.HighWatermark().IsZero() {
 		t.Fatalf("fresh aggregator should have zero watermark, got %v", procB.HighWatermark())
 	}
@@ -119,11 +157,23 @@ func TestWindow_WatermarkPersistsAcrossRestart(t *testing.T) {
 	}
 
 	// And critically: a bucket from procA's run that is now stale
-	// (bucketStart + duration + lateness < watermark) must be
+	// (bucketStart + duration + lateness <= watermark) must be
 	// considered closed by procB, so the flusher will pick it up.
+	// Before LoadWatermark existed, procB's watermark was zero and
+	// IsClosed said false forever — the stranded bucket would sit in
+	// Redis until its TTL silently discarded the data.
 	if !procB.IsClosed(bucketTime) {
-		t.Fatalf("after LoadWatermark, a historical bucket must be IsClosed (watermark=%v, bucket=%v, duration=%v)",
-			procB.HighWatermark(), bucketTime, dur)
+		t.Fatalf("after LoadWatermark, a historical bucket must be IsClosed (watermark=%v, bucket=%v, duration=%v, lateness=%v, close point=%v)",
+			procB.HighWatermark(), bucketTime, dur, lateness, bucketTime.Add(dur).Add(lateness))
+	}
+
+	// The negative pair, so the assertion above can't pass by
+	// IsClosed simply always returning true: the bucket the stream is
+	// currently filling must NOT be closed — the watermark sits inside
+	// it, and a straggler for it could still legitimately arrive.
+	if procB.IsClosed(currentBucket) {
+		t.Fatalf("the bucket the watermark sits inside must NOT be closed (watermark=%v, bucket=%v, close point=%v)",
+			procB.HighWatermark(), currentBucket, currentBucket.Add(dur).Add(lateness))
 	}
 }
 

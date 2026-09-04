@@ -1,8 +1,10 @@
 // Package stream provides Kafka producer and consumer wrappers.
 //
 // Ch05: EventProducer publishes events to Kafka after they are written to
-//       PostgreSQL. The event_type becomes the Kafka message key so events
-//       from the same tenant/type land on the same partition (ordering).
+//       PostgreSQL. The tenant_id becomes the Kafka message key, and the
+//       writer uses the Hash balancer so that key actually decides the
+//       partition — every event for a tenant lands on the same partition
+//       and is therefore consumed in produce order.
 //
 // Ch12: EventConsumer and window aggregation are added here.
 package stream
@@ -28,14 +30,63 @@ type EventProducer struct {
 }
 
 // NewEventProducer creates a producer that writes to the given Kafka brokers.
-// The writer uses LeastBytes balancer — events spread across partitions by
-// volume. Use Hash(key) balancer when ordering within a tenant matters.
+//
+// The balancer is Hash, NOT LeastBytes. This matters, and an earlier
+// version got it wrong in a way that was invisible from the code:
+// the message Key was already set to the tenant ID with a comment
+// claiming per-tenant ordering, but LeastBytes ignores the key
+// entirely and routes by which partition it has written the fewest
+// bytes to. The key was decorative; two events for the same tenant
+// could land on different partitions, and Kafka only orders within a
+// partition. Three places in this codebase depend on the guarantee
+// the comment claimed:
+//
+//   1. EventConsumer's contract (consumer.go, teaching point 5)
+//      states outright that "since the producer keys by tenant_id,
+//      all events for a tenant arrive in partition order". With
+//      LeastBytes that sentence was false.
+//
+//   2. WindowAggregator's watermark (window.go). The aggregator
+//      routes an event to the "late" bucket when its event_time is
+//      before high_watermark - allowedLateness. Split a tenant's
+//      stream across partitions consumed at different rates and a
+//      perfectly punctual event can arrive after the watermark has
+//      already jumped ahead — it gets booked as late, and the
+//      on-time window silently under-counts. That is a wrong number
+//      in the analytics, not just a reordering.
+//
+//   3. The 1-minute / 1-hour aggregates and their flush to
+//      tenant_window_stats inherit the same defect: IsClosed()
+//      declares a bucket flushable based on the watermark, so a
+//      bucket can be closed and flushed while in-order-produced
+//      events for that tenant are still queued behind a slower
+//      partition.
+//
+// internal/billing/outbox/kafka_publisher.go already made this
+// choice correctly (`&kafka.Hash{}`, "partition by tenant_id key");
+// this brings the event topic in line with it.
+//
+// The cost of Hash is real but acceptable: partitions are only as
+// balanced as the tenant key distribution, so one very large tenant
+// makes one hot partition. Ordering is a correctness property here
+// and byte-balance is a performance property, so correctness wins.
+// If a hot tenant ever becomes the bottleneck, the fix is a
+// composite key (tenant + sub-stream) that preserves ordering within
+// whatever unit actually needs it — not a return to LeastBytes.
+//
+// Note on hash compatibility: kafka-go's Hash uses FNV-1a with the
+// same int32 conversion as Sarama's hashPartitioner. It is NOT
+// wire-compatible with the Java client's murmur2, so a non-Go
+// producer writing this topic would place the same tenant on a
+// different partition. Every producer to nexus.events is kafka-go,
+// so this holds today; it is a constraint to remember if that
+// changes.
 func NewEventProducer(brokers []string) *EventProducer {
 	return &EventProducer{
 		writer: &kafka.Writer{
 			Addr:                   kafka.TCP(brokers...),
 			Topic:                  TopicEvents,
-			Balancer:               &kafka.LeastBytes{},
+			Balancer:               &kafka.Hash{},
 			AllowAutoTopicCreation: true,
 		},
 	}
