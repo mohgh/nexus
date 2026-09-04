@@ -6,6 +6,18 @@
 // Creates 10,000 events across the seeded tenants with varied event types,
 // realistic payloads (including PII for Ch14 masking demos), and timestamps
 // spread over the last 30 days.
+//
+// The seeder writes the SAME two tables the real ingest path writes
+// (internal/storage/postgres/event_repo.go Create): the append-only
+// `events_store` log first, then the `events` read projection, both in
+// one transaction. An earlier version inserted into `events` only,
+// which left the log that the architecture calls the source of truth
+// holding a fraction of a percent of the data — and made
+// cmd/projection-rebuild faithfully rebuild a read model of ~10 events
+// for a database of 10,008. Anything that replays the log (projection
+// rebuild, the Ch13 catch-up subscriptions, GDPR erasure by stream)
+// only sees what is in `events_store`, so a seeder that skips it isn't
+// seeding the system, only one of its projections.
 package main
 
 import (
@@ -16,9 +28,90 @@ import (
 	"os"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mohgh/nexus/internal/config"
 )
+
+// batchSize is how many events share one transaction. 10,000 separate
+// transactions is ~10,000 fsyncs; one transaction for all 10,000 holds
+// a single long write and makes a mid-run failure all-or-nothing.
+// Batching in the middle keeps the seeder fast while bounding how much
+// work a failure throws away.
+const batchSize = 500
+
+// seedEvent is one generated event, held just long enough to be
+// written to both tables in the same transaction.
+type seedEvent struct {
+	id         string
+	tenantID   string
+	eventType  string
+	payload    []byte
+	value      float64
+	occurredAt time.Time
+}
+
+// insertBatch writes a slice of events to events_store and events in a
+// single transaction, mirroring EventRepository.Create. Both statements
+// for a given event are queued adjacently so the log row and its
+// projection row commit together and in that order.
+func insertBatch(ctx context.Context, pool *pgxpool.Pool, events []seedEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	batch := &pgx.Batch{}
+	for _, e := range events {
+		// The canonical record. Shape matches event_repo.go exactly —
+		// the projections unmarshal tenant_id/event_type/value out of
+		// this JSON, so a different shape here would silently produce
+		// zeroed projections.
+		storePayload, err := json.Marshal(map[string]any{
+			"tenant_id":  e.tenantID,
+			"event_type": e.eventType,
+			"payload":    json.RawMessage(e.payload),
+			"value":      e.value,
+			"id":         e.id,
+		})
+		if err != nil {
+			return fmt.Errorf("marshal store payload: %w", err)
+		}
+
+		batch.Queue(
+			`INSERT INTO events_store (stream_name, event_type, data, metadata, occurred_at)
+			 VALUES ($1, 'EventIngested', $2, '{}'::jsonb, $3)`,
+			"tenant-"+e.tenantID, storePayload, e.occurredAt,
+		)
+		batch.Queue(
+			`INSERT INTO events (id, tenant_id, event_type, payload, value, occurred_at)
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
+			e.id, e.tenantID, e.eventType, e.payload, e.value, e.occurredAt,
+		)
+	}
+
+	results := tx.SendBatch(ctx, batch)
+	for i := 0; i < batch.Len(); i++ {
+		if _, err := results.Exec(); err != nil {
+			_ = results.Close()
+			return fmt.Errorf("batch statement %d: %w", i, err)
+		}
+	}
+	if err := results.Close(); err != nil {
+		return fmt.Errorf("close batch: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
 
 func main() {
 	cfg := config.Load()
@@ -63,8 +156,29 @@ func main() {
 
 	now := time.Now().UTC()
 	inserted := 0
+	pending := make([]seedEvent, 0, batchSize)
 
-	for i := range 10000 {
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		if err := insertBatch(ctx, pool, pending); err != nil {
+			// A batch failure is fatal rather than skipped: the old
+			// per-row loop logged and continued, which could leave the
+			// log and its projection at different lengths. Both tables
+			// move together or the run stops.
+			fmt.Fprintf(os.Stderr, "insert batch (events %d–%d): %v\n",
+				inserted+1, inserted+len(pending), err)
+			os.Exit(1)
+		}
+		inserted += len(pending)
+		pending = pending[:0]
+		if inserted%1000 == 0 || inserted == 10000 {
+			fmt.Printf("  %d events inserted...\n", inserted)
+		}
+	}
+
+	for range 10000 {
 		tenantID := tenantIDs[rng.Intn(len(tenantIDs))]
 		eventType := eventTypes[rng.Intn(len(eventTypes))]
 		daysAgo := rng.Intn(30)
@@ -91,21 +205,29 @@ func main() {
 
 		payloadJSON, _ := json.Marshal(payload)
 
-		_, err := pool.Exec(ctx,
-			`INSERT INTO events (tenant_id, event_type, payload, value, occurred_at)
-			 VALUES ($1, $2, $3, $4, $5)`,
-			tenantID, eventType, payloadJSON, value, occurredAt,
-		)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "insert event %d: %v\n", i, err)
-			continue
-		}
-		inserted++
-
-		if inserted%1000 == 0 {
-			fmt.Printf("  %d events inserted...\n", inserted)
+		// The ID is generated here rather than left to the events.id
+		// column default, because the same ID has to appear inside the
+		// events_store payload — that is what ties a log entry to its
+		// projection row, exactly as the real ingest path does.
+		//
+		// Deliberately NOT drawn from rng: the seeder is re-runnable
+		// (`make seed` twice, workshop resets), and a reproducible ID
+		// sequence would make the second run die on the events primary
+		// key. rng still drives all the content, so the *shape* of the
+		// seed data stays reproducible.
+		pending = append(pending, seedEvent{
+			id:         uuid.NewString(),
+			tenantID:   tenantID,
+			eventType:  eventType,
+			payload:    payloadJSON,
+			value:      value,
+			occurredAt: occurredAt,
+		})
+		if len(pending) == batchSize {
+			flush()
 		}
 	}
+	flush()
 
 	fmt.Printf("Done. %d events seeded across %d tenants over the last 30 days.\n",
 		inserted, len(tenantIDs))
