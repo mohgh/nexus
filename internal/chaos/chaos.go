@@ -7,8 +7,13 @@
 //
 //   1. Slow vs. dead. A handler that takes 4 seconds (db_delay_ms=4000)
 //      still succeeds; a handler that takes 15 seconds (db_delay_ms=15000)
-//      times out via the per-call deadline and trips the breaker.
-//      That asymmetry is the chapter's headline lesson on timeouts.
+//      times out via the per-call deadline and counts as a breaker
+//      failure. That asymmetry is the chapter's headline lesson on
+//      timeouts — but it only holds when the chaos wrappers are wired
+//      INSIDE the resilience wrapper (see chaos.EventRepository), so
+//      that the injected delay is subject to the breaker's timeout.
+//      Wired outermost, the sleep happens above the breaker and is
+//      invisible to it.
 //
 //   2. Transient errors. error_rate=30 returns errors on ~30% of calls;
 //      students watch the circuit breaker count failures and trip at

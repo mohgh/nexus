@@ -25,13 +25,37 @@ type ResilientEventRepository struct {
 // Compile-time assertion.
 var _ domain.EventRepository = (*ResilientEventRepository)(nil)
 
+// DefaultCallTimeout is the per-call deadline applied to every
+// operation. It is the "slow" half of the slow-vs-dead demo: a
+// dependency that takes longer than this is treated as a failure and
+// counted by the breaker. DefaultSettings.Interval is chosen relative
+// to this value — see the arithmetic on DefaultSettings.
+const DefaultCallTimeout = 5 * time.Second
+
 // NewResilientEventRepository wraps repo with three circuit breakers:
 // one each for Create, List, and Search. They trip independently —
 // a slow search doesn't affect ingestion.
+//
+// Wrap the chaos repo (if any) BELOW this one — resilience → chaos →
+// storage — so injected faults are visible to the breakers.
 func NewResilientEventRepository(repo domain.EventRepository, reg *Registry, logger *zap.Logger) *ResilientEventRepository {
-	createCB := NewBreaker[struct{}]("event.create", DefaultSettings, logger)
-	listCB := NewBreaker[[]*domain.Event]("event.list", DefaultSettings, logger)
-	searchCB := NewBreaker[[]*domain.Event]("event.search", DefaultSettings, logger)
+	return NewResilientEventRepositoryWith(repo, reg, logger, DefaultSettings, DefaultCallTimeout)
+}
+
+// NewResilientEventRepositoryWith is NewResilientEventRepository with
+// explicit breaker settings and per-call timeout. Production uses the
+// defaults; tests use it to run the same code paths on sub-second
+// timescales instead of the 5s/30s production ones.
+func NewResilientEventRepositoryWith(
+	repo domain.EventRepository,
+	reg *Registry,
+	logger *zap.Logger,
+	s Settings,
+	timeout time.Duration,
+) *ResilientEventRepository {
+	createCB := NewBreaker[struct{}]("event.create", s, logger)
+	listCB := NewBreaker[[]*domain.Event]("event.list", s, logger)
+	searchCB := NewBreaker[[]*domain.Event]("event.search", s, logger)
 
 	reg.Register("event.create", createCB)
 	reg.Register("event.list", listCB)
@@ -42,7 +66,7 @@ func NewResilientEventRepository(repo domain.EventRepository, reg *Registry, log
 		create:  createCB,
 		list:    listCB,
 		search:  searchCB,
-		timeout: 5 * time.Second,
+		timeout: timeout,
 	}
 }
 

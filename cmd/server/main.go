@@ -157,17 +157,28 @@ func main() {
 	// the current state from /api/v1/circuit-breakers.
 	resilience.InstallMetrics(srv.Metrics())
 
-	// Chaos profile threads in front of the resilience wrapper so
-	// the slow-vs-dead demo works: a 15s injected delay (longer
-	// than the inner 5s repo timeout) trips the breaker; a 4s delay
-	// (within the timeout) does not.
+	// Chaos sits INSIDE the resilience wrapper (resilience → chaos →
+	// postgres). A decorator can only inject faults into the layers
+	// BELOW it, so chaos has to be the inner one for the breaker to
+	// observe what it injects: an injected delay is then subject to
+	// the breaker's 5s per-call timeout, and an injected error is
+	// counted as a breaker failure.
+	//
+	// That ordering is what makes the slow-vs-dead demo work: a 15s
+	// injected delay exceeds the 5s repo timeout, so the call fails
+	// and the breaker tallies a failure; a 4s delay finishes inside
+	// the timeout and the breaker stays healthy.
+	//
+	// Wrapping the other way round (chaos outermost) puts both the
+	// injected sleep and the injected error outside the breaker's
+	// scope entirely — the breaker never sees them.
 	chaosProfile := chaos.New()
-	events := chaos.NewEventRepository(chaosProfile,
-		resilience.NewResilientEventRepository(
+	events := resilience.NewResilientEventRepository(
+		chaos.NewEventRepository(chaosProfile,
 			pgstore.NewEventRepository(replicaPool),
-			breakerReg,
-			logger,
 		),
+		breakerReg,
+		logger,
 	)
 	srv.WithEvents(events).WithChaos(chaosProfile)
 
@@ -257,10 +268,13 @@ func main() {
 				// bug the audit flagged: /api/v1/chaos kept
 				// mutating state but the toggles silently
 				// stopped affecting writes.
-				srv.WithEvents(chaos.NewEventRepository(chaosProfile,
-					resilience.NewResilientEventRepository(
-						shardedEvents, breakerReg, logger,
-					),
+				//
+				// Same ordering as the single-Postgres path above:
+				// resilience → chaos → storage, so injected faults
+				// land underneath the breaker where it can see them.
+				srv.WithEvents(resilience.NewResilientEventRepository(
+					chaos.NewEventRepository(chaosProfile, shardedEvents),
+					breakerReg, logger,
 				))
 				srv.WithShardAdmin(shardedEvents)
 				logger.Info("shard pool: sharded events repository wired",

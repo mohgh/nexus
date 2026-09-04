@@ -10,20 +10,26 @@ import (
 // fault-injection toggles. Live profile mutations from the chaos
 // endpoint take effect on the next call — no restart needed.
 //
-// Wire it as the OUTERMOST event-repo layer in main.go, so chaos
-// gets to inject before either the resilience (circuit breaker)
-// or the sharded routing layer sees the request:
+// Wire it INSIDE the resilience wrapper in main.go — directly
+// around the real storage repo — so that everything it injects
+// happens underneath the circuit breaker and its per-call timeout:
 //
-//	chaos.NewEventRepository(profile,
-//	    resilience.NewResilientEventRepository(
-//	        pgstore.NewEventRepository(replicaPool), ...))
+//	resilience.NewResilientEventRepository(
+//	    chaos.NewEventRepository(profile,
+//	        pgstore.NewEventRepository(replicaPool)), ...)
 //
-// That ordering is what makes the "slow vs dead" demo work:
-// db_delay_ms=15000 forces a 15-second pause, the inner timeout
-// (5s in the resilience wrapper) fires, the breaker tallies a
-// failure. With db_delay_ms=4000 the call eventually succeeds and
-// the breaker stays healthy. The two cases produce different
-// observable system behavior.
+// A decorator can only inject faults into the layers BELOW it. If
+// chaos were the outermost layer, MaybeError would return before
+// the breaker was ever entered and MaybeDelayDB would sleep outside
+// the scope of the 5s timeout — the breaker would observe neither.
+//
+// With chaos on the inside, the "slow vs dead" demo works:
+// db_delay_ms=15000 forces a 15-second pause, the resilience
+// wrapper's 5s per-call timeout fires, and the breaker tallies a
+// failure. With db_delay_ms=4000 the call completes inside the
+// timeout and the breaker stays healthy. Likewise error_rate=100
+// produces failures the breaker actually counts. The two cases
+// produce different observable system behavior.
 type EventRepository struct {
 	profile *Profile
 	inner   domain.EventRepository

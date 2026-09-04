@@ -52,19 +52,46 @@ type Breaker[T any] struct {
 type Settings struct {
 	// MaxRequests in half-open state before deciding if the dependency recovered.
 	MaxRequests uint32
-	// Interval resets failure counts in closed state (0 = never reset).
+	// Interval is how often gobreaker CLEARS the counters while the
+	// breaker is closed — it is a periodic reset, not a sliding
+	// window. Every Interval the consecutive-failure count goes back
+	// to zero, so an Interval shorter than the time it takes to
+	// accumulate ConsecutiveFailures failures makes the breaker
+	// unable to trip. 0 = never reset in the closed state.
 	Interval time.Duration
 	// Timeout is how long the breaker stays open before switching to half-open.
 	Timeout time.Duration
-	// Threshold is the minimum number of requests before tripping.
-	// The breaker trips when FailureRatio of requests in the last Interval fail.
+	// ConsecutiveFailures is the number of failures IN A ROW that
+	// trips the breaker (see the ReadyToTrip func in NewBreaker —
+	// it is a raw count, not a ratio). Any single success resets
+	// the run to zero.
 	ConsecutiveFailures uint32
 }
 
 // DefaultSettings returns conservative defaults suitable for a web service.
+//
+// Interval arithmetic — the reason it is 0 rather than a small
+// duration. ResilientEventRepository gives each call a 5s timeout, so
+// the *slowest* way to reach ConsecutiveFailures=5 is 5 × 5s = 25s of
+// wall clock (a dependency that hangs rather than one that errors
+// fast). Interval is a periodic counter WIPE in the closed state, so
+// any Interval below that arithmetic bound guarantees the counter is
+// cleared before the fifth failure lands: the old 10s Interval let the
+// count oscillate 1,0,1,0 forever and the breaker was structurally
+// unable to trip on the slow dependency it exists to protect against.
+//
+// A nonzero Interval would have to comfortably exceed 25s (60s+, so a
+// failure run straddling a wipe still trips on the next window). We
+// choose 0 instead — never reset while closed — because the trip rule
+// is consecutive-failure based: a single success already resets the
+// run to zero, which is exactly the "forget old failures" behaviour
+// Interval would otherwise provide. The side benefit is that the
+// counters reported by /api/v1/circuit-breakers stop reading 0/0
+// between wipes and instead show real totals since the last state
+// change (gobreaker clears counts on every transition).
 var DefaultSettings = Settings{
 	MaxRequests:         3,
-	Interval:            10 * time.Second,
+	Interval:            0,
 	Timeout:             30 * time.Second,
 	ConsecutiveFailures: 5,
 }
