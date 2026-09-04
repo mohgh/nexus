@@ -1,7 +1,10 @@
 package ratelimit
 
 import (
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestLimitForPlan(t *testing.T) {
@@ -80,4 +83,106 @@ func TestMemoryLimiter_RetunesWithoutDiscardingTokens(t *testing.T) {
 	if res.Remaining < 10 || res.Remaining > 19 {
 		t.Fatalf("post-upgrade remaining should preserve accumulated tokens (~14), got %d", res.Remaining)
 	}
+}
+
+// TestMemoryLimiter_ConcurrentDenialsDoNotLeakTokens is the regression test
+// for the Reserve/Cancel token leak. Reservation.CancelAt refuses to refund a
+// reservation if any other reservation was taken in between, so under
+// concurrency a reject-by-cancel implementation burns a token on nearly every
+// *rejected* request and drives the bucket arbitrarily negative — after which
+// it never refills back to positive and no request past the initial burst is
+// ever served again.
+//
+// The assertions are deliberately banded, not exact: over a window of
+// `window` at RPS/Burst the served count should land near burst+rps*elapsed,
+// and the bucket must never end up in debt.
+func TestMemoryLimiter_ConcurrentDenialsDoNotLeakTokens(t *testing.T) {
+	t.Parallel()
+
+	const (
+		goroutines = 64
+		window     = time.Second
+	)
+	lim := Limit{RPS: 10, Burst: 10}
+	const key = "t:hammer"
+
+	m := NewMemoryLimiter()
+	defer m.Close()
+
+	var (
+		allowed   atomic.Int64
+		denied    atomic.Int64
+		badRetry  atomic.Int64
+		negRemain atomic.Int64
+		wg        sync.WaitGroup
+	)
+
+	deadline := time.Now().Add(window)
+	start := time.Now()
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				res := m.Allow(key, lim)
+				if res.Allowed {
+					allowed.Add(1)
+				} else {
+					denied.Add(1)
+					if res.RetryAfter <= 0 {
+						badRetry.Add(1)
+					}
+				}
+				if res.Remaining < 0 {
+					negRemain.Add(1)
+				}
+				// Keep the loop hot but not a pure spin — plenty of calls
+				// per refilled token without pinning every core.
+				time.Sleep(time.Millisecond)
+			}
+		}()
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	got := allowed.Load()
+	if denied.Load() == 0 {
+		t.Fatalf("test is not exercising the reject path: %d allowed, 0 denied", got)
+	}
+	if badRetry.Load() != 0 {
+		t.Errorf("%d denied results carried a non-positive Retry-After", badRetry.Load())
+	}
+	if negRemain.Load() != 0 {
+		t.Errorf("%d results reported a negative Remaining", negRemain.Load())
+	}
+
+	// Expected served ≈ burst + rps*elapsed. Band generously: the lower
+	// bound only needs to be above `burst`, which is all a leaking bucket
+	// ever manages, and the upper bound guards against over-serving.
+	expect := float64(lim.Burst) + lim.RPS*elapsed.Seconds()
+	lo := int64(float64(lim.Burst) + 0.5*lim.RPS*elapsed.Seconds())
+	hi := int64(expect*1.5) + 5
+	if got < lo || got > hi {
+		t.Errorf("allowed=%d over %v, want within [%d,%d] (≈%.1f = burst+rps*elapsed); "+
+			"a count stuck at the burst (%d) means rejected requests are burning tokens",
+			got, elapsed, lo, hi, expect, lim.Burst)
+	}
+
+	// The bucket itself must not be in debt: every rejection must have left
+	// the token count untouched.
+	if tk := internalTokens(m, key); tk < -0.001 {
+		t.Errorf("bucket went negative after the run: tokens=%.3f (rejections are consuming tokens)", tk)
+	}
+}
+
+// internalTokens reads the raw (unclamped) token count of key's bucket.
+// Result.Remaining clamps negatives to 0, which would hide a deficit.
+func internalTokens(m *MemoryLimiter, key string) float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.entries[key]
+	if !ok {
+		return 0
+	}
+	return e.lim.Tokens()
 }

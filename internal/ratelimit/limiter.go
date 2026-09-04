@@ -122,17 +122,36 @@ func (m *MemoryLimiter) Allow(key string, lim Limit) Result {
 
 	// rate.Limiter is internally synchronised, so we can operate on it
 	// after releasing our own lock.
-	res := l.Reserve()
-	if !res.OK() {
-		// Only happens if a single request exceeds the burst — impossible
-		// with cost 1 and burst >= 1, but handle defensively.
-		return Result{Allowed: false, RetryAfter: time.Second, Remaining: 0}
+	//
+	// Allow (not Reserve+Cancel) is the only leak-free way to reject: a
+	// cancelled reservation is *not* refunded if another reservation slipped
+	// in between the Reserve and the Cancel (see Reservation.CancelAt), which
+	// under concurrency is most rejections. Every rejected request would then
+	// permanently burn a token and drive the bucket arbitrarily negative.
+	if l.Allow() {
+		return Result{Allowed: true, Remaining: tokens(l)}
 	}
-	if delay := res.Delay(); delay > 0 {
-		res.Cancel() // return the token; we're rejecting rather than waiting
-		return Result{Allowed: false, RetryAfter: delay, Remaining: tokens(l)}
+	return Result{Allowed: false, RetryAfter: retryAfter(l, lim), Remaining: tokens(l)}
+}
+
+// retryAfter estimates how long until the bucket holds a whole token again,
+// from the tokens currently banked and the configured refill rate. It never
+// touches the bucket, so it cannot consume or leak capacity.
+func retryAfter(l *rate.Limiter, lim Limit) time.Duration {
+	if lim.RPS <= 0 {
+		// A zero/negative rate never refills; nothing useful to promise.
+		return time.Second
 	}
-	return Result{Allowed: true, Remaining: tokens(l)}
+	deficit := 1 - l.Tokens()
+	if deficit <= 0 {
+		// Raced with a refill: a token is (or is about to be) available.
+		return time.Millisecond
+	}
+	d := time.Duration(deficit / lim.RPS * float64(time.Second))
+	if d <= 0 {
+		return time.Millisecond
+	}
+	return d
 }
 
 func tokens(l *rate.Limiter) int {
