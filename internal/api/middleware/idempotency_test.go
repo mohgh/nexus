@@ -3,7 +3,10 @@ package middleware
 import (
 	"bytes"
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/mohgh/nexus/internal/auth"
 )
@@ -107,5 +110,94 @@ func TestRequestFingerprint_FieldDelimiterPreventsAmbiguity(t *testing.T) {
 
 	if bytes.Equal(a, b) {
 		t.Fatalf("method/path boundary ambiguity:\n  a=%x\n  b=%x", a, b)
+	}
+}
+
+// TestIdempotencyTimings_AdvertisedRetryAfterIsAchievable pins the
+// invariants that make the 409 IDEMPOTENCY_REQUEST_IN_PROGRESS
+// response honest. These are pure constant relationships, so they
+// belong in the unit tier — the integration test only observes the
+// resulting header.
+//
+// The old numbers violated every one of these: Retry-After said 5
+// seconds while an in-flight original could legitimately hold the
+// reservation for the full 10s request timeout, and a genuinely
+// abandoned row was cleared only by a 5-minute sweep on a 1-minute
+// tick — a 6-minute worst case behind a 5-second promise.
+func TestIdempotencyTimings_AdvertisedRetryAfterIsAchievable(t *testing.T) {
+	t.Parallel()
+
+	// A client told to retry sooner than the request timeout is being
+	// told to retry before the answer can possibly exist.
+	if retryAfterInFlight < maxHandlerRuntime {
+		t.Fatalf("retryAfterInFlight (%v) < maxHandlerRuntime (%v): every "+
+			"obedient retry is a guaranteed 409", retryAfterInFlight, maxHandlerRuntime)
+	}
+
+	// Retry-After is serialised as whole seconds, so a sub-second
+	// value would truncate to "0" and turn the backoff into a spin.
+	if int(retryAfterInFlight.Seconds()) < 1 {
+		t.Fatalf("retryAfterInFlight (%v) truncates to 0 seconds on the wire",
+			retryAfterInFlight)
+	}
+
+	// The sweeper must never reclaim a reservation that a live
+	// request could still be holding — that would re-admit the
+	// double-execution the reservation exists to prevent.
+	if inFlightStaleTTL <= maxHandlerRuntime {
+		t.Fatalf("inFlightStaleTTL (%v) <= maxHandlerRuntime (%v): the sweeper "+
+			"can delete a reservation that is still live, letting a concurrent "+
+			"retry run the handler a second time", inFlightStaleTTL, maxHandlerRuntime)
+	}
+
+	// And the backstop must stay within an order of magnitude of what
+	// we advertise, or the header is fiction again for the crashed-
+	// process case.
+	worstCase := inFlightStaleTTL + inFlightSweepInterval
+	if worstCase > 10*retryAfterInFlight {
+		t.Fatalf("worst-case stale-reservation clearance (%v) is more than 10x "+
+			"the advertised Retry-After (%v); a client obeying the header burns "+
+			"%d pointless retries", worstCase, retryAfterInFlight,
+			int(worstCase/retryAfterInFlight))
+	}
+}
+
+// TestCleanupContext_SurvivesRequestCancellation is the unit-tier
+// guard for the reservation leak: the context used to release a
+// reservation must NOT die with the request, because the request dies
+// exactly when the client is about to retry. It must still carry the
+// request's values so the failure logs stay attributable.
+func TestCleanupContext_SurvivesRequestCancellation(t *testing.T) {
+	t.Parallel()
+
+	type ctxKey struct{}
+
+	reqCtx, cancel := context.WithCancel(
+		context.WithValue(context.Background(), ctxKey{}, "request-id-42"))
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/events", nil).WithContext(reqCtx)
+
+	cleanupCtx, cleanupCancel := cleanupContext(r)
+	defer cleanupCancel()
+
+	// The request dies — timeout or client disconnect.
+	cancel()
+
+	if err := cleanupCtx.Err(); err != nil {
+		t.Fatalf("cleanup context died with the request: %v.\n"+
+			"A mutual-exclusion primitive must not share a lifetime with the "+
+			"thing it protects.", err)
+	}
+	if got := cleanupCtx.Value(ctxKey{}); got != "request-id-42" {
+		t.Fatalf("cleanup context lost the request's values: got %v.\n"+
+			"WithoutCancel is chosen over Background precisely to keep them.", got)
+	}
+	deadline, ok := cleanupCtx.Deadline()
+	if !ok {
+		t.Fatal("cleanup context must be bounded; an unbounded one can pin a " +
+			"goroutine on a wedged database forever")
+	}
+	if until := time.Until(deadline); until > cleanupTimeout+time.Second {
+		t.Fatalf("cleanup deadline %v out is longer than cleanupTimeout (%v)",
+			until, cleanupTimeout)
 	}
 }

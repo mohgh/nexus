@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -26,6 +27,59 @@ const defaultIdempotencyTTL = 24 * time.Hour
 // than this skip the cache entirely (run uncached) — better than
 // risking OOM on a giant payload to satisfy a header.
 const maxRequestBodyForFingerprint = 1 << 20 // 1 MiB
+
+// maxHandlerRuntime mirrors the router's request-level timeout
+// (chi middleware.Timeout(10s), see internal/api/router.go). It is the
+// ceiling on how long a request can legitimately hold an in_flight
+// reservation, and so the unit that both the advertised Retry-After
+// and the stale-reservation sweep are derived from. If the router's
+// timeout changes, change this with it.
+const maxHandlerRuntime = 10 * time.Second
+
+// retryAfterInFlight is what a 409 IDEMPOTENCY_REQUEST_IN_PROGRESS
+// advertises. It must be a number a client can actually obey.
+//
+// The dominant reason for seeing an in_flight row is "the original
+// request is genuinely still running", and that resolves within
+// maxHandlerRuntime — either the handler finishes, or the router's
+// timeout fires and the cleanup below releases the reservation. So the
+// honest answer is "a little more than the request timeout"; the small
+// margin keeps a client that retries exactly on the deadline from
+// racing the original's own cleanup.
+//
+// It used to say 5 seconds, which was not achievable by any mechanism
+// in the system: a genuinely stuck row was cleared only by the sweeper
+// (inFlightStaleTTL, below), so an obedient client burned dozens of
+// guaranteed-409 retries before the row could possibly go away.
+const retryAfterInFlight = maxHandlerRuntime + 2*time.Second
+
+// cleanupTimeout bounds a reservation-cleanup DB call. Cleanup runs
+// after the response is already written (or abandoned), so it must not
+// pin a pool connection or a goroutine for long — but it must be long
+// enough to survive an ordinary slow round trip.
+const cleanupTimeout = 3 * time.Second
+
+// cleanupContext returns the context used to release or complete a
+// reservation. It is deliberately DETACHED from the request context.
+//
+// The reservation is a mutual-exclusion primitive, and a mutual-
+// exclusion primitive must never share a lifetime with the thing it
+// protects. r.Context() is cancelled exactly when the request times out
+// (chi middleware.Timeout) or the client disconnects — which is to say,
+// exactly in the situations that cause the client to retry. Cleaning up
+// on it meant the DB call failed instantly and the in_flight row
+// survived, so every retry got 409 until the sweeper ran, and the
+// reservation was released only when nobody needed it released.
+//
+// context.WithoutCancel rather than context.Background: it drops
+// cancellation and deadlines while KEEPING the request-scoped values
+// (request ID, auth principal, trace span), so the warn logs on the
+// failure paths below are still attributable to the request that
+// leaked. The bounded timeout on top keeps a wedged database from
+// holding the goroutine open indefinitely.
+func cleanupContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(r.Context()), cleanupTimeout)
+}
 
 // IdempotencyConfig wires the middleware to a Postgres pool.
 type IdempotencyConfig struct {
@@ -56,7 +110,9 @@ type IdempotencyConfig struct {
 //     captured response; on non-2xx DELETE the reservation so
 //     retries can proceed cleanly; on panic the deferred cleanup
 //     deletes the reservation and the chi Recoverer (outer) writes
-//     the 500.
+//     the 500. All three run on a detached, short-deadline context
+//     (see cleanupContext) so the reservation is released even when
+//     the request itself timed out or the client hung up.
 //
 // Storing only 2xx responses matches Stripe's behaviour: a transient
 // 500 is retryable. Storing the entire response (status +
@@ -198,7 +254,8 @@ func Idempotency(cfg IdempotencyConfig) func(http.Handler) http.Handler {
 					// back off — replaying nothing yet is correct;
 					// double-running the handler is what we're
 					// preventing here.
-					w.Header().Set("Retry-After", "5")
+					w.Header().Set("Retry-After",
+						strconv.Itoa(int(retryAfterInFlight.Seconds())))
 					http.Error(w,
 						`{"error":"request with this Idempotency-Key is in progress","code":"IDEMPOTENCY_REQUEST_IN_PROGRESS"}`,
 						http.StatusConflict,
@@ -211,6 +268,9 @@ func Idempotency(cfg IdempotencyConfig) func(http.Handler) http.Handler {
 			// response. The defer ensures the reservation is cleaned
 			// up if the handler panics — without it, a stuck row
 			// would block retries until the cleanup goroutine swept.
+			//
+			// EVERY exit path below cleans up on cleanupContext(r),
+			// never on r.Context(). See cleanupContext for why.
 			rec := newRecordingWriter(w)
 			normalExit := false
 			defer func() {
@@ -220,7 +280,9 @@ func Idempotency(cfg IdempotencyConfig) func(http.Handler) http.Handler {
 				// Panic path: drop the reservation so the chi
 				// Recoverer (outer) can write 500 and a future retry
 				// can proceed.
-				if delErr := deleteReservation(context.Background(), cfg.Pool, key); delErr != nil {
+				ctx, cancel := cleanupContext(r)
+				defer cancel()
+				if delErr := deleteReservation(ctx, cfg.Pool, key); delErr != nil {
 					logger.Warn("idempotency: cleanup after panic failed",
 						zap.String("key", key),
 						zap.Error(delErr),
@@ -229,12 +291,28 @@ func Idempotency(cfg IdempotencyConfig) func(http.Handler) http.Handler {
 			}()
 			next.ServeHTTP(rec, r)
 
+			cleanupCtx, cancelCleanup := cleanupContext(r)
+			defer cancelCleanup()
+
 			if rec.status >= 200 && rec.status < 300 {
+				// Cache the 2xx even if the request context is already
+				// dead. A 2xx means the handler's side effects
+				// committed; the reservation exists to stop those from
+				// happening twice, and the cached response is the only
+				// record that they happened at all. Dropping it because
+				// the caller went away would let the retry re-run the
+				// handler and duplicate the write — precisely the
+				// failure this middleware exists to prevent. The client
+				// may never have received these bytes (chi's Timeout
+				// turns the response into a 504, a disconnected client
+				// receives nothing), but that is an argument FOR
+				// caching: the retry then gets the true outcome of the
+				// work instead of repeating it.
 				ct := rec.Header().Get("Content-Type")
 				if ct == "" {
 					ct = "application/json"
 				}
-				if err := completeReservation(r.Context(), cfg.Pool,
+				if err := completeReservation(cleanupCtx, cfg.Pool,
 					key, rec.status, rec.body.Bytes(), ct,
 				); err != nil {
 					logger.Warn("idempotency: complete failed",
@@ -245,8 +323,12 @@ func Idempotency(cfg IdempotencyConfig) func(http.Handler) http.Handler {
 			} else {
 				// Non-2xx: drop the reservation so a retry isn't
 				// stuck on a transient failure (the in_flight row
-				// would otherwise return 409 until cleanup).
-				if err := deleteReservation(r.Context(), cfg.Pool, key); err != nil {
+				// would otherwise return 409 until cleanup). This is
+				// the timed-out-request path too: chi's Timeout
+				// cancels the context, the handler bails with a 5xx,
+				// and the reservation must be released so the retry
+				// the client is about to send can actually run.
+				if err := deleteReservation(cleanupCtx, cfg.Pool, key); err != nil {
 					logger.Warn("idempotency: delete on non-2xx failed",
 						zap.String("key", key),
 						zap.Error(err),
@@ -475,18 +557,51 @@ func deleteReservation(ctx context.Context, pool *pgxpool.Pool, key string) erro
 
 // inFlightStaleTTL is how long an in_flight reservation is allowed
 // to live before the cleanup considers it abandoned (e.g. the
-// original process died between INSERT and the deferred delete).
-// Picked to comfortably exceed any reasonable handler runtime.
-const inFlightStaleTTL = 5 * time.Minute
+// original process was killed between the INSERT and the deferred
+// cleanup).
+//
+// The bound that matters is maxHandlerRuntime: the router caps every
+// request at 10s, so no live request can hold a reservation longer
+// than that, and the cleanup paths above now release it even when the
+// request times out or the client disconnects. 6x that ceiling leaves
+// a wide margin for clock skew and a slow cleanup round trip while
+// keeping the abandoned-row window near the Retry-After we advertise.
+//
+// The margin is the safety-critical direction: sweeping a reservation
+// that is still live would let a concurrent retry run the handler a
+// second time — the exact double-execution this design prevents. Err
+// long, never short.
+//
+// It used to be 5 minutes, chosen when cleanup routinely failed and
+// the sweeper was the primary release mechanism rather than the
+// backstop it is now.
+const inFlightStaleTTL = 6 * maxHandlerRuntime
+
+// inFlightSweepInterval is the sweep cadence. Worst-case time for an
+// abandoned reservation to clear is inFlightStaleTTL +
+// inFlightSweepInterval (75s), so a client obeying Retry-After
+// (12s) reaches it in a handful of retries rather than the ~60 the
+// old 5-second header implied against a 6-minute worst case.
+const inFlightSweepInterval = 15 * time.Second
+
+// completedSweepInterval is the cadence for expiring cached responses.
+// Unchanged from the original 1-minute tick: those rows live for the
+// full TTL (24h by default), so sweeping them more often only repeats
+// a scan that no index supports.
+const completedSweepInterval = time.Minute
 
 // RunIdempotencyCleanup loops until ctx is cancelled, deleting
-// expired cache rows on a 1-minute cadence. Two separate TTLs:
+// expired cache rows. Two separate TTLs, on two separate cadences:
 //
-//   - state='completed' rows: TTL (default 24h) — the cache window
-//     after which a retry runs the handler again.
-//   - state='in_flight' rows: 5 minutes — anything older is assumed
-//     to be a stuck reservation from a crashed process and is
-//     deleted so retries can proceed.
+//   - state='completed' rows: TTL (default 24h), swept every
+//     completedSweepInterval — the cache window after which a retry
+//     runs the handler again.
+//   - state='in_flight' rows: inFlightStaleTTL, swept every
+//     inFlightSweepInterval — anything older is
+//     assumed to be a stuck reservation from a crashed process and is
+//     deleted so retries can proceed. This is a backstop only: the
+//     middleware releases its own reservation on every exit path,
+//     including request timeout and client disconnect.
 //
 // The cleanup is a Postgres DELETE per state and holds no global
 // state, so it's safe to run from every instance simultaneously.
@@ -498,10 +613,18 @@ func RunIdempotencyCleanup(ctx context.Context, pool *pgxpool.Pool, ttl time.Dur
 		logger = zap.NewNop()
 	}
 
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
+	// Two cadences, deliberately. The in_flight sweep is the backstop
+	// behind the advertised Retry-After, so it must be frequent — and
+	// it is cheap, riding the partial index from migration 010. The
+	// completed sweep has no supporting index and a 24h TTL, so
+	// running it any faster than the original 1-minute cadence would
+	// buy nothing and cost a repeated scan of the whole table.
+	inFlightTicker := time.NewTicker(inFlightSweepInterval)
+	defer inFlightTicker.Stop()
+	completedTicker := time.NewTicker(completedSweepInterval)
+	defer completedTicker.Stop()
 
-	sweep := func() {
+	sweepCompleted := func() {
 		// Completed rows past their TTL.
 		if tag, err := pool.Exec(ctx,
 			`DELETE FROM processed_idempotency_keys
@@ -516,7 +639,9 @@ func RunIdempotencyCleanup(ctx context.Context, pool *pgxpool.Pool, ttl time.Dur
 				zap.Int64("rows", n),
 			)
 		}
+	}
 
+	sweepInFlight := func() {
 		// Stuck in_flight rows from crashed processes. The partial
 		// index on (created_at) WHERE state='in_flight' (migration
 		// 010) keeps this scan tight.
@@ -534,14 +659,18 @@ func RunIdempotencyCleanup(ctx context.Context, pool *pgxpool.Pool, ttl time.Dur
 			)
 		}
 	}
-	// Run once on startup, then on cadence.
-	sweep()
+
+	// Run both once on startup, then on their own cadences.
+	sweepCompleted()
+	sweepInFlight()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			sweep()
+		case <-inFlightTicker.C:
+			sweepInFlight()
+		case <-completedTicker.C:
+			sweepCompleted()
 		}
 	}
 }
