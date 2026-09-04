@@ -597,6 +597,43 @@ func exposeRequestID(next http.Handler) http.Handler {
 	})
 }
 
+// knownMethods is the closed set of HTTP methods allowed to appear
+// verbatim in the `method` Prometheus label. It is the RFC-9110
+// method registry as net/http spells it — deliberately a fixed list
+// and NOT "whatever the router happens to register", so that a 405
+// on a route that doesn't serve PUT is still distinguishable from
+// junk. The comparison is exact (no ToUpper) because chi's own
+// dispatch is exact too: a request for "get" does not match a
+// r.Get() route, and the label should say so rather than pretend it
+// was a well-formed GET.
+var knownMethods = map[string]struct{}{
+	http.MethodGet:     {},
+	http.MethodHead:    {},
+	http.MethodPost:    {},
+	http.MethodPut:     {},
+	http.MethodPatch:   {},
+	http.MethodDelete:  {},
+	http.MethodConnect: {},
+	http.MethodOptions: {},
+	http.MethodTrace:   {},
+}
+
+// methodOtherLabel is the single bucket every unrecognised method
+// collapses into.
+const methodOtherLabel = "other"
+
+// metricMethod clamps a request method to a bounded label value.
+// Unknown methods are counted under methodOtherLabel — counted, not
+// dropped: a burst of garbage methods is itself a signal worth
+// alerting on, and dropping the sample would create a blind spot in
+// the SLO error-rate denominators.
+func metricMethod(method string) string {
+	if _, ok := knownMethods[method]; ok {
+		return method
+	}
+	return methodOtherLabel
+}
+
 // metricsMiddleware records HTTP request count and latency in Prometheus.
 // Ch02: introduced here. Every subsequent chapter inherits this automatically.
 //
@@ -615,9 +652,25 @@ func exposeRequestID(next http.Handler) http.Handler {
 //      and crater Prometheus performance. Route pattern caps it at
 //      one series per route.
 //
+// The SAME argument applies to the `method` label, which an earlier
+// version of this middleware overlooked: an HTTP method is an
+// RFC-9110 *token*, not an enum. net/http validates it as a token
+// and then hands the handler whatever the client sent, so passing
+// r.Method straight to WithLabelValues mints one counter series
+// (plus one histogram series per bucket boundary) per invented
+// method. That is attacker-controlled unbounded cardinality, and it
+// is reachable without credentials: /api/v1/metrics is mounted
+// outside all three auth groups while RateLimit is mounted inside
+// them, so the same anonymous caller can both inflate the registry
+// and scrape it to watch the damage. metricMethod above clamps the
+// label to a fixed set with one "other" bucket, which bounds the
+// product of the two labels at (10 × routes × statuses).
+//
 // The access log STILL prefers the masked path (from PIIDetect)
 // over r.URL.Path, since logs need the actual URL for debugging
-// but want the PII removed.
+// but want the PII removed — and it still logs the raw r.Method,
+// because a log line is cheap and bounded-retention, unlike a
+// Prometheus time series.
 func (s *Server) metricsMiddleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -647,8 +700,9 @@ func (s *Server) metricsMiddleware() func(http.Handler) http.Handler {
 			// rules. The SLO recording rules also filter this
 			// label as a defense in depth.
 			if metricPath != "/api/v1/metrics" {
-				s.metrics.HTTPRequests.WithLabelValues(r.Method, metricPath, status).Inc()
-				s.metrics.HTTPDuration.WithLabelValues(r.Method, metricPath).Observe(duration.Seconds())
+				methodLabel := metricMethod(r.Method)
+				s.metrics.HTTPRequests.WithLabelValues(methodLabel, metricPath, status).Inc()
+				s.metrics.HTTPDuration.WithLabelValues(methodLabel, metricPath).Observe(duration.Seconds())
 			}
 
 			loggedPath := r.URL.Path
