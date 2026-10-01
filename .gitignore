@@ -21,3 +21,6 @@ tmp/
 .DS_Store
 .idea/
 .vscode/
+
+# local compose overrides (ports, resource limits) — never committed
+docker-compose.override.yml
